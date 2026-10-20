@@ -182,7 +182,9 @@ impl ArosWindowInner {
         }
         let taken = self.callbacks.borrow_mut().request_frame.take();
         if let Some(mut f) = taken {
+            let started = Instant::now();
             f(RequestFrameOptions::default());
+            crate::stats::frame(started.elapsed());
             self.callbacks.borrow_mut().request_frame = Some(f);
         }
     }
@@ -196,6 +198,7 @@ impl ArosWindowInner {
         let mut event = GpaEvent::default();
         // SAFETY: valid handle; gpa_poll_event returns 1 while events remain.
         while unsafe { glue::gpa_poll_event(handle, &mut event) } == 1 {
+            crate::stats::event();
             self.dispatch_event(&event);
             if self.state.borrow().closed {
                 return;
@@ -786,14 +789,18 @@ impl PlatformWindow for ArosWindow {
         // Dirty-rect repaint: the renderer diffs the scene against the
         // previous frame and rasterizes only the damaged region; None means
         // an identical frame — no raster, no blit.
+        let raster_started = Instant::now();
         let Some(damage) = state.renderer.draw(scene) else {
+            crate::stats::skipped();
             return;
         };
+        let raster = raster_started.elapsed();
         let dev_w = state.renderer.width() as i32;
         let stride = dev_w * 4;
         let handle = state.handle;
         let data = state.renderer.framebuffer();
 
+        let blit_started = Instant::now();
         // SAFETY: valid handle; data is the full framebuffer, and the glue
         // blits the (x, y, w, h) subrect out of it (same stride).
         unsafe {
@@ -807,6 +814,7 @@ impl PlatformWindow for ArosWindow {
                 damage.y1 - damage.y0,
             );
         }
+        crate::stats::painted(raster, blit_started.elapsed(), damage);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

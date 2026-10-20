@@ -336,10 +336,20 @@ pub(crate) fn capture(scene: &Scene) -> Vec<Fingerprint> {
     out
 }
 
-/// Display-list diff: common prefix + common suffix; the damage is the
-/// union of every remaining (changed/inserted/removed) primitive's rect
-/// from both frames. `None` = frames identical, nothing to repaint.
+/// Display-list diff. The common prefix and suffix are dropped first (the
+/// classic case: one run of primitives changed). The middle is then walked
+/// with both frames in step: equal primitives are unchanged and cost
+/// nothing; at a mismatch the walk looks ahead up to `RESYNC` primitives on
+/// either side for the next equal pair, and only what it skipped over is
+/// damaged. Two changes far apart in paint order (a hovered row and the
+/// status bar, say) therefore damage two small rectangles' union, not
+/// everything painted between them. The damage is the union of every
+/// changed, inserted or removed primitive's rect from both frames; `None`
+/// means the frames are identical. Painter's order stays correct because
+/// the renderer re-walks the whole scene clipped to the damage.
 pub(crate) fn diff(prev: &[Fingerprint], cur: &[Fingerprint]) -> Option<DamageRect> {
+    const RESYNC: usize = 48;
+
     let common = prev.len().min(cur.len());
     let mut prefix = 0;
     while prefix < common && prev[prefix] == cur[prefix] {
@@ -354,12 +364,43 @@ pub(crate) fn diff(prev: &[Fingerprint], cur: &[Fingerprint]) -> Option<DamageRe
     {
         suffix += 1;
     }
+    let p = &prev[prefix..prev.len() - suffix];
+    let c = &cur[prefix..cur.len() - suffix];
 
     let mut damage = DamageRect::EMPTY;
-    for fp in &prev[prefix..prev.len() - suffix] {
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < p.len() && j < c.len() {
+        if p[i] == c[j] {
+            i += 1;
+            j += 1;
+            continue;
+        }
+        // The nearest equal pair ahead, by the number of primitives skipped
+        // on both sides together.
+        let mut found = None;
+        'search: for distance in 1..=RESYNC {
+            for di in 0..=distance {
+                let dj = distance - di;
+                if i + di < p.len() && j + dj < c.len() && p[i + di] == c[j + dj] {
+                    found = Some((di, dj));
+                    break 'search;
+                }
+            }
+        }
+        let (di, dj) = found.unwrap_or((1, 1));
+        for fp in &p[i..(i + di).min(p.len())] {
+            damage.union(fp.rect());
+        }
+        for fp in &c[j..(j + dj).min(c.len())] {
+            damage.union(fp.rect());
+        }
+        i += di;
+        j += dj;
+    }
+    for fp in &p[i.min(p.len())..] {
         damage.union(fp.rect());
     }
-    for fp in &cur[prefix..cur.len() - suffix] {
+    for fp in &c[j.min(c.len())..] {
         damage.union(fp.rect());
     }
     (!damage.is_empty()).then_some(damage)

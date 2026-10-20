@@ -26,6 +26,8 @@ use tiny_skia::{
 };
 
 use crate::atlas::CpuAtlas;
+use std::time::Instant;
+
 use crate::damage::{self, DamageRect, Fingerprint};
 
 pub(crate) struct CpuRenderer {
@@ -162,42 +164,54 @@ impl CpuRenderer {
                 PrimitiveBatch::Shadows(range) => {
                     for shadow in &scene.shadows[range] {
                         if touches(&current, &mut index) {
+                            let t = Instant::now();
                             self.draw_shadow(shadow);
+                            crate::stats::kind("Shadows", t.elapsed());
                         }
                     }
                 }
                 PrimitiveBatch::Quads(range) => {
                     for quad in &scene.quads[range] {
                         if touches(&current, &mut index) {
+                            let t = Instant::now();
                             self.draw_quad(quad);
+                            crate::stats::kind("Quads", t.elapsed());
                         }
                     }
                 }
                 PrimitiveBatch::Paths(range) => {
                     for path in &scene.paths[range] {
                         if touches(&current, &mut index) {
+                            let t = Instant::now();
                             self.draw_path(path);
+                            crate::stats::kind("Paths", t.elapsed());
                         }
                     }
                 }
                 PrimitiveBatch::Underlines(range) => {
                     for underline in &scene.underlines[range] {
                         if touches(&current, &mut index) {
+                            let t = Instant::now();
                             self.draw_underline(underline);
+                            crate::stats::kind("Underlines", t.elapsed());
                         }
                     }
                 }
                 PrimitiveBatch::MonochromeSprites { range, .. } => {
                     for sprite in &scene.monochrome_sprites[range] {
                         if touches(&current, &mut index) {
+                            let t = Instant::now();
                             self.draw_monochrome_sprite(sprite);
+                            crate::stats::kind("MonochromeSprites", t.elapsed());
                         }
                     }
                 }
                 PrimitiveBatch::PolychromeSprites { range, .. } => {
                     for sprite in &scene.polychrome_sprites[range] {
                         if touches(&current, &mut index) {
+                            let t = Instant::now();
                             self.draw_polychrome_sprite(sprite);
+                            crate::stats::kind("PolychromeSprites", t.elapsed());
                         }
                     }
                 }

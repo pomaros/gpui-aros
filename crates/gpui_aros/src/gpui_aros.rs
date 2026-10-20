@@ -15,6 +15,7 @@
 //! `gpa_*` externs that only resolve when collect-aros links the final
 //! binary, which would break `cargo test` on the host.
 
+mod stats;
 mod atlas;
 mod damage;
 pub mod input;
