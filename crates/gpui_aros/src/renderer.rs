@@ -15,13 +15,15 @@
 // window/platform shell that drives them in production is cfg-gated.
 #![cfg_attr(not(target_os = "aros"), allow(dead_code))]
 
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
     Bounds, ContentMask, DevicePixels, Hsla, PrimitiveBatch, Quad, Rgba, ScaledPixels, Scene, Size,
 };
 use tiny_skia::{
-    Color, FillRule, FilterQuality, Mask, Paint, PathBuilder, Pixmap, PixmapPaint,
+    Color, FillRule, FilterQuality, IntRect, Mask, Paint, PathBuilder, Pixmap, PixmapPaint,
     PremultipliedColorU8, Rect, Stroke, Transform,
 };
 
@@ -34,7 +36,18 @@ pub(crate) struct CpuRenderer {
     pixmap: Pixmap,
     atlas: Arc<CpuAtlas>,
     clip_key: Option<ClipKey>,
+    /// The rectangular clip of the current primitive: its content mask
+    /// intersected with the damage, in device pixels; `None` when it covers
+    /// the whole framebuffer. Rectangles and 1:1 sprites are clipped
+    /// geometrically against it; only a primitive that straddles its edge
+    /// and cannot be cropped (a rounded fill, a stroke, a path, a scaled
+    /// sprite) needs the pixel mask below, built lazily for this key.
+    clip_rect: Option<DamageRect>,
     clip_mask: Option<Mask>,
+    /// Glyphs tinted once per (tile, color) and reused: a frame of text is
+    /// thousands of sprites, and tinting each from its coverage bytes every
+    /// time was most of the raster cost.
+    tinted: HashMap<TintKey, Rc<Pixmap>>,
     /// Last frame's primitive fingerprints (paint order); empty = the next
     /// draw repaints everything. See `damage.rs`.
     prev_frame: Vec<Fingerprint>,
@@ -45,6 +58,12 @@ pub(crate) struct CpuRenderer {
 
 type ClipKey = (i32, i32, i32, i32);
 
+/// A monochrome atlas tile under one color: (texture index, tile id, color bits).
+type TintKey = (u32, u32, [u32; 4]);
+
+/// Tinted glyphs kept before the cache is emptied (a few hundred KB).
+const TINTED_CAP: usize = 8192;
+
 impl CpuRenderer {
     pub(crate) fn new(size: Size<DevicePixels>) -> Self {
         let (w, h) = clamp_size(size);
@@ -52,10 +71,66 @@ impl CpuRenderer {
             pixmap: Pixmap::new(w, h).expect("failed to allocate framebuffer pixmap"),
             atlas: Arc::new(CpuAtlas::new()),
             clip_key: None,
+            clip_rect: None,
             clip_mask: None,
+            tinted: HashMap::new(),
             prev_frame: Vec::new(),
             damage: None,
         }
+    }
+
+    /// The pixel mask for the current clip, built on first use for this
+    /// clip key; `None` when the clip covers the framebuffer.
+    fn clip_mask_lazy(&mut self) -> Option<&Mask> {
+        let rect = self.clip_rect?;
+        if self.clip_mask.is_none() {
+            let mut mask = Mask::new(self.pixmap.width(), self.pixmap.height());
+            if let (Some(mask), Some(r)) = (
+                mask.as_mut(),
+                Rect::from_xywh(
+                    rect.x0 as f32,
+                    rect.y0 as f32,
+                    (rect.x1 - rect.x0).max(0) as f32,
+                    (rect.y1 - rect.y0).max(0) as f32,
+                ),
+            ) {
+                mask.fill_path(
+                    &PathBuilder::from_rect(r),
+                    FillRule::Winding,
+                    false,
+                    Transform::identity(),
+                );
+            }
+            self.clip_mask = mask;
+        }
+        self.clip_mask.as_ref()
+    }
+
+    /// Whether a primitive with `bounds` needs the pixel mask: not when the
+    /// clip covers the framebuffer or the primitive lies inside the clip.
+    /// When it does, the mask is ready in `clip_mask` afterwards (the
+    /// caller reads that field directly, beside the mutable framebuffer).
+    fn needs_mask(&mut self, bounds: &Bounds<ScaledPixels>) -> bool {
+        let Some(rect) = self.clip_rect else {
+            return false;
+        };
+        if inside(bounds, &rect) {
+            return false;
+        }
+        self.clip_mask_lazy().is_some()
+    }
+
+    /// `rect` cut down to the current clip, or `None` when nothing is left.
+    fn clipped_rect(&self, rect: Rect) -> Option<Rect> {
+        let Some(c) = self.clip_rect else {
+            return Some(rect);
+        };
+        Rect::from_ltrb(
+            rect.left().max(c.x0 as f32),
+            rect.top().max(c.y0 as f32),
+            rect.right().min(c.x1 as f32),
+            rect.bottom().min(c.y1 as f32),
+        )
     }
 
     /// Force the next `draw` to repaint and re-blit the whole window
@@ -89,6 +164,7 @@ impl CpuRenderer {
         if self.pixmap.width() != w || self.pixmap.height() != h {
             self.pixmap = Pixmap::new(w, h).expect("failed to allocate framebuffer pixmap");
             self.clip_key = None;
+            self.clip_rect = None;
             self.clip_mask = None;
             self.prev_frame.clear();
         }
@@ -135,7 +211,11 @@ impl CpuRenderer {
         // painter's order within the region stays intact.
         self.damage = Some(damage);
         self.clip_key = None;
+        self.clip_rect = None;
         self.clip_mask = None;
+        if self.tinted.len() > TINTED_CAP {
+            self.tinted.clear();
+        }
         if let Some(rect) = Rect::from_xywh(
             damage.x0 as f32,
             damage.y0 as f32,
@@ -222,6 +302,7 @@ impl CpuRenderer {
 
         self.damage = None;
         self.clip_key = None;
+        self.clip_rect = None;
         self.clip_mask = None;
         self.prev_frame = current;
         Some(damage)
@@ -230,16 +311,17 @@ impl CpuRenderer {
     fn draw_quad(&mut self, quad: &Quad) {
         let bounds = quad.bounds;
         self.update_clip(&quad.content_mask);
-        let mask = self.clip_mask.as_ref();
 
         // Background fill: solid or two-stop linear gradient. Patterns
-        // (slash/checkerboard) have no accessor yet and stay TODO.
+        // (slash/checkerboard) have no accessor yet and stay TODO. A square
+        // quad is cut to the clip and filled without a mask.
         if let Some(paint) = background_paint(&quad.background, &bounds) {
             if is_square(&quad.corner_radii) {
-                if let Some(rect) = to_rect(&bounds) {
-                    self.pixmap.fill_rect(rect, &paint, Transform::identity(), mask);
+                if let Some(rect) = to_rect(&bounds).and_then(|r| self.clipped_rect(r)) {
+                    self.pixmap.fill_rect(rect, &paint, Transform::identity(), None);
                 }
             } else if let Some(path) = rounded_rect_path(&bounds, &quad.corner_radii) {
+                let mask = if self.needs_mask(&bounds) { self.clip_mask.as_ref() } else { None };
                 self.pixmap.fill_path(
                     &path,
                     &paint,
@@ -257,15 +339,15 @@ impl CpuRenderer {
         // those as full boxes (Browse tree, 2026-07-21). Draw each edge as
         // its own filled strip instead (straight edges; with corner radii
         // this ignores the rounding, which chrome never combines with
-        // per-side borders).
+        // per-side borders). Square outlines are four strips too: no
+        // stroke, no mask.
         let bw = &quad.border_widths;
         let (t, r, b, l) = (bw.top.0, bw.right.0, bw.bottom.0, bw.left.0);
         let max_width = t.max(r).max(b).max(l);
         if max_width > 0.0 && !quad.border_color.is_transparent() {
             let paint = solid_paint(quad.border_color);
             let uniform = t == r && r == b && b == l;
-            if uniform {
-                let mask = self.clip_mask.as_ref();
+            if uniform && !is_square(&quad.corner_radii) {
                 let stroke = Stroke {
                     width: max_width,
                     ..Stroke::default()
@@ -273,9 +355,8 @@ impl CpuRenderer {
                 // Inset the stroke by half its width so it stays inside the bounds.
                 let inset = max_width / 2.0;
                 let inset_bounds = inset_bounds(&bounds, inset);
-                if let Some(path) = rounded_rect_path(&inset_bounds, &quad.corner_radii)
-                    .or_else(|| to_rect(&inset_bounds).map(|r| PathBuilder::from_rect(r)))
-                {
+                if let Some(path) = rounded_rect_path(&inset_bounds, &quad.corner_radii) {
+                    let mask = if self.needs_mask(&bounds) { self.clip_mask.as_ref() } else { None };
                     self.pixmap
                         .stroke_path(&path, &paint, &stroke, Transform::identity(), mask);
                 }
@@ -291,45 +372,59 @@ impl CpuRenderer {
                     (r > 0.0).then(|| Rect::from_ltrb(x1 - r, y0, x1, y1)),
                 ];
                 for rect in sides.into_iter().flatten().flatten() {
-                    self.pixmap.fill_rect(
-                        rect,
-                        &paint,
-                        Transform::identity(),
-                        self.clip_mask.as_ref(),
-                    );
+                    if let Some(rect) = self.clipped_rect(rect) {
+                        self.pixmap
+                            .fill_rect(rect, &paint, Transform::identity(), None);
+                    }
                 }
             }
         }
     }
 
     fn draw_monochrome_sprite(&mut self, sprite: &gpui::MonochromeSprite) {
-        let Some(tile) = self.atlas.read_tile(&sprite.tile) else {
-            return;
-        };
-        if tile.bytes_per_pixel != 1 || tile.width == 0 || tile.height == 0 {
-            return;
-        }
-
-        // Build a tinted premultiplied RGBA pixmap from the alpha coverage.
-        let Some(mut sprite_pixmap) = Pixmap::new(tile.width as u32, tile.height as u32) else {
-            return;
-        };
         let tint: Rgba = sprite.color.into();
-        let dst = sprite_pixmap.data_mut();
-        for (i, &coverage) in tile.data.iter().enumerate() {
-            let a = ((coverage as f32) * tint.a).round().clamp(0.0, 255.0) as u8;
-            let premul = |c: f32| ((c * a as f32).round()).clamp(0.0, 255.0) as u8;
-            let px = PremultipliedColorU8::from_rgba(premul(tint.r), premul(tint.g), premul(tint.b), a)
-                .unwrap_or(PremultipliedColorU8::TRANSPARENT);
-            let o = i * 4;
-            dst[o] = px.red();
-            dst[o + 1] = px.green();
-            dst[o + 2] = px.blue();
-            dst[o + 3] = px.alpha();
-        }
+        let key: TintKey = (
+            sprite.tile.texture_id.index,
+            sprite.tile.tile_id.0,
+            [tint.r.to_bits(), tint.g.to_bits(), tint.b.to_bits(), tint.a.to_bits()],
+        );
+        let sprite_pixmap = match self.tinted.get(&key) {
+            Some(p) => p.clone(),
+            None => {
+                let Some(tile) = self.atlas.read_tile(&sprite.tile) else {
+                    return;
+                };
+                if tile.bytes_per_pixel != 1 || tile.width == 0 || tile.height == 0 {
+                    return;
+                }
+                // Build a tinted premultiplied RGBA pixmap from the alpha coverage.
+                let Some(mut pixmap) = Pixmap::new(tile.width as u32, tile.height as u32) else {
+                    return;
+                };
+                let dst = pixmap.data_mut();
+                for (i, &coverage) in tile.data.iter().enumerate() {
+                    let a = ((coverage as f32) * tint.a).round().clamp(0.0, 255.0) as u8;
+                    let premul = |c: f32| ((c * a as f32).round()).clamp(0.0, 255.0) as u8;
+                    let px = PremultipliedColorU8::from_rgba(
+                        premul(tint.r),
+                        premul(tint.g),
+                        premul(tint.b),
+                        a,
+                    )
+                    .unwrap_or(PremultipliedColorU8::TRANSPARENT);
+                    let o = i * 4;
+                    dst[o] = px.red();
+                    dst[o + 1] = px.green();
+                    dst[o + 2] = px.blue();
+                    dst[o + 3] = px.alpha();
+                }
+                let pixmap = Rc::new(pixmap);
+                self.tinted.insert(key, pixmap.clone());
+                pixmap
+            }
+        };
 
         self.update_clip(&sprite.content_mask);
-        let mask = self.clip_mask.as_ref();
         // The GPU backends *sample* the tile into the layout bounds; blit
         // 1:1 only when they match (glyphs — keeps text pixel-crisp) and
         // scale otherwise. SVGs are rasterized at 2× the layout size
@@ -341,29 +436,69 @@ impl CpuRenderer {
         if dst_w <= 0.0 || dst_h <= 0.0 {
             return;
         }
-        let sx = dst_w / tile.width as f32;
-        let sy = dst_h / tile.height as f32;
+        let sx = dst_w / sprite_pixmap.width() as f32;
+        let sy = dst_h / sprite_pixmap.height() as f32;
         let x = sprite.bounds.origin.x.0;
         let y = sprite.bounds.origin.y.0;
         // TODO: honor sprite.transformation (glyphs are axis-aligned in practice).
         if (sx - 1.0).abs() < 0.001 && (sy - 1.0).abs() < 0.001 {
-            self.pixmap.draw_pixmap(
-                x.round() as i32,
-                y.round() as i32,
-                sprite_pixmap.as_ref(),
-                &PixmapPaint::default(),
-                Transform::identity(),
-                mask,
-            );
+            let (ix, iy) = (x.round() as i32, y.round() as i32);
+            let (w, h) = (sprite_pixmap.width() as i32, sprite_pixmap.height() as i32);
+            match self.clip_rect {
+                None => self.pixmap.draw_pixmap(
+                    ix,
+                    iy,
+                    sprite_pixmap.as_ref().as_ref(),
+                    &PixmapPaint::default(),
+                    Transform::identity(),
+                    None,
+                ),
+                Some(c) => {
+                    // Crop the glyph to the clip instead of masking the blit.
+                    let (cx0, cy0) = (ix.max(c.x0), iy.max(c.y0));
+                    let (cx1, cy1) = ((ix + w).min(c.x1), (iy + h).min(c.y1));
+                    if cx0 >= cx1 || cy0 >= cy1 {
+                        return;
+                    }
+                    if cx0 == ix && cy0 == iy && cx1 == ix + w && cy1 == iy + h {
+                        self.pixmap.draw_pixmap(
+                            ix,
+                            iy,
+                            sprite_pixmap.as_ref().as_ref(),
+                            &PixmapPaint::default(),
+                            Transform::identity(),
+                            None,
+                        );
+                    } else if let Some(part) = IntRect::from_xywh(
+                        cx0 - ix,
+                        cy0 - iy,
+                        (cx1 - cx0) as u32,
+                        (cy1 - cy0) as u32,
+                    )
+                    .and_then(|r| sprite_pixmap.clone_rect(r))
+                    {
+                        self.pixmap.draw_pixmap(
+                            cx0,
+                            cy0,
+                            part.as_ref(),
+                            &PixmapPaint::default(),
+                            Transform::identity(),
+                            None,
+                        );
+                    }
+                }
+            }
         } else {
             let paint = PixmapPaint {
                 quality: FilterQuality::Bilinear,
                 ..PixmapPaint::default()
             };
+            let bounds = sprite.bounds;
+            let mask = if self.needs_mask(&bounds) { self.clip_mask.as_ref() } else { None };
             self.pixmap.draw_pixmap(
                 0,
                 0,
-                sprite_pixmap.as_ref(),
+                sprite_pixmap.as_ref().as_ref(),
                 &paint,
                 Transform::from_scale(sx, sy).post_translate(x, y),
                 mask,
@@ -408,6 +543,8 @@ impl CpuRenderer {
         }
 
         self.update_clip(&sprite.content_mask);
+        let bounds = sprite.bounds;
+        let base_mask = if self.needs_mask(&bounds) { self.clip_mask.clone() } else { None };
         // Rounded corners need a shape clip on top of the rectangular
         // content mask; build a one-off intersection so the cached
         // rect-only mask stays valid for the next primitive.
@@ -415,7 +552,7 @@ impl CpuRenderer {
             None
         } else {
             rounded_rect_path(&sprite.bounds, &sprite.corner_radii).map(|path| {
-                let mut mask = match self.clip_mask.clone() {
+                let mut mask = match base_mask.clone() {
                     Some(m) => m,
                     None => {
                         let mut m = Mask::new(self.pixmap.width(), self.pixmap.height())
@@ -441,7 +578,7 @@ impl CpuRenderer {
                 mask
             })
         };
-        let mask = corner_mask.as_ref().or(self.clip_mask.as_ref());
+        let mask = corner_mask.as_ref().or(base_mask.as_ref());
 
         // Blit, scaling when layout and tile sizes differ (fractional
         // display scales, zoomed images).
@@ -502,7 +639,8 @@ impl CpuRenderer {
             return;
         };
         self.update_clip(&path.content_mask);
-        let mask = self.clip_mask.as_ref();
+        let bounds = path.bounds;
+        let mask = if self.needs_mask(&bounds) { self.clip_mask.as_ref() } else { None };
         paint.anti_alias = false;
         self.pixmap
             .fill_path(&skia_path, &paint, FillRule::Winding, Transform::identity(), mask);
@@ -518,7 +656,6 @@ impl CpuRenderer {
             return;
         }
         self.update_clip(&underline.content_mask);
-        let mask = self.clip_mask.as_ref();
         let paint = solid_paint(underline.color);
         let b = &underline.bounds;
         let thickness = underline.thickness.0.max(0.5);
@@ -529,12 +666,16 @@ impl CpuRenderer {
                 b.origin.y.0,
                 b.size.width.0,
                 b.size.height.0.min(thickness).max(0.5),
-            ) {
+            )
+            .and_then(|r| self.clipped_rect(r))
+            {
                 self.pixmap
-                    .fill_rect(rect, &paint, Transform::identity(), mask);
+                    .fill_rect(rect, &paint, Transform::identity(), None);
             }
             return;
         }
+        let ub = underline.bounds;
+        let mask = if self.needs_mask(&ub) { self.clip_mask.as_ref() } else { None };
 
         let width = b.size.width.0;
         if width <= 0.0 {
@@ -588,10 +729,11 @@ impl CpuRenderer {
 
         let blur = shadow.blur_radius.0.max(0.0);
         let base: Rgba = shadow.color.into();
+        let shadow_bounds = shadow.bounds;
         if blur < 1.0 {
             // Sharp shadow: a single fill of the quad.
             if let Some(path) = rounded_rect_path(&shadow.bounds, &shadow.corner_radii) {
-                let mask = self.clip_mask.as_ref();
+                let mask = if self.needs_mask(&shadow_bounds) { self.clip_mask.as_ref() } else { None };
                 self.pixmap.fill_path(
                     &path,
                     &solid_paint(shadow.color),
@@ -618,7 +760,7 @@ impl CpuRenderer {
             };
             let mut layer = base;
             layer.a *= w;
-            let mask = self.clip_mask.as_ref();
+            let mask = if self.needs_mask(&shadow_bounds) { self.clip_mask.as_ref() } else { None };
             self.pixmap.fill_path(
                 &path,
                 &solid_paint(Hsla::from(layer)),
@@ -629,8 +771,9 @@ impl CpuRenderer {
         }
     }
 
-    /// Rebuild the clip mask for `content_mask` if it changed. A clip covering
-    /// the whole framebuffer sets no mask (`clip_mask = None`).
+    /// Set the clip for `content_mask`: its rect intersected with the
+    /// damage. A clip covering the whole framebuffer sets none. The pixel
+    /// mask is built only when a primitive asks for it (`needs_mask`).
     fn update_clip(&mut self, content_mask: &ContentMask<ScaledPixels>) {
         let b = &content_mask.bounds;
         let mut x0 = b.origin.x.0.floor() as i32;
@@ -647,38 +790,29 @@ impl CpuRenderer {
             y1 = y1.min(damage.y1);
         }
         let key = (x0, y0, x1, y1);
+        if self.clip_key == Some(key) {
+            return;
+        }
+        self.clip_key = Some(key);
+        self.clip_mask = None;
 
         let w = self.pixmap.width() as i32;
         let h = self.pixmap.height() as i32;
         if x0 <= 0 && y0 <= 0 && x1 >= w && y1 >= h {
-            self.clip_key = None;
-            self.clip_mask = None;
-            return;
+            self.clip_rect = None;
+        } else {
+            self.clip_rect = Some(DamageRect { x0, y0, x1, y1 });
         }
-        if self.clip_key == Some(key) {
-            return;
-        }
-
-        let mut mask = Mask::new(self.pixmap.width(), self.pixmap.height());
-        if let (Some(mask), Some(rect)) = (
-            mask.as_mut(),
-            Rect::from_xywh(
-                x0 as f32,
-                y0 as f32,
-                (x1 - x0).max(0) as f32,
-                (y1 - y0).max(0) as f32,
-            ),
-        ) {
-            mask.fill_path(
-                &PathBuilder::from_rect(rect),
-                FillRule::Winding,
-                false,
-                Transform::identity(),
-            );
-        }
-        self.clip_mask = mask;
-        self.clip_key = Some(key);
     }
+}
+
+/// Whether `bounds` lies inside the integer clip `rect`.
+fn inside(bounds: &Bounds<ScaledPixels>, rect: &DamageRect) -> bool {
+    let x0 = bounds.origin.x.0;
+    let y0 = bounds.origin.y.0;
+    let x1 = x0 + bounds.size.width.0;
+    let y1 = y0 + bounds.size.height.0;
+    x0 >= rect.x0 as f32 && y0 >= rect.y0 as f32 && x1 <= rect.x1 as f32 && y1 <= rect.y1 as f32
 }
 
 fn clamp_size(size: Size<DevicePixels>) -> (u32, u32) {
