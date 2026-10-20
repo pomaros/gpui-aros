@@ -99,10 +99,7 @@ impl Render for Smoke {
     }
 }
 
-/// Entry point called by the C harness after AROS startup. Returns the magic
-/// on clean run-loop exit so the harness can print PASS.
-#[unsafe(no_mangle)]
-pub extern "C" fn aros_gpui_smoke_main() -> u32 {
+fn main() {
     gpui_platform::application().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(560.), px(360.)), cx);
         let window = cx.open_window(
@@ -121,5 +118,5 @@ pub extern "C" fn aros_gpui_smoke_main() -> u32 {
             cx.quit();
         }
     });
-    0x47505541 // "GPUA"
+    println!("GpuiSmoke: result=PASS");
 }

@@ -5,16 +5,14 @@ publish = false
 edition = "2024"
 license = "Apache-2.0"
 
-# A staticlib, linked into an AROS C: command by link-aros.sh (mirroring
-# hosted/rust/std-build.sh): C owns AROS startup and calls
-# aros_gpui_smoke_main, which opens a real GPUI window through the
-# gpui_aros backend.
-[lib]
-crate-type = ["staticlib"]
+# A Rust `bin`: AROS's C start-up hands argc/argv to std and runs the
+# constructors; linked through the crosstools clang's AROS driver (the
+# `linker` of the consumer's AROS cargo configuration, see Ferail's
+# scripts/aros-cargo.sh) into the `GpuiSmoke` command.
+[[bin]]
+name = "GpuiSmoke"
+path = "src/main.rs"
 
-# Standalone like gpui_aros (the Zed workspace excludes it): GPUI comes from
-# the `gpui-pre` crates.io snapshots and the platform crate is the AROS fork
-# of `gpui-pre-platform`, patched in below.
 [dependencies]
 gpui = { package = "gpui-pre", version = "=0.3.8", default-features = false }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8" }
