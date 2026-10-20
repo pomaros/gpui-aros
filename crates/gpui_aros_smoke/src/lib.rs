@@ -123,17 +123,3 @@ pub extern "C" fn aros_gpui_smoke_main() -> u32 {
     });
     0x47505541 // "GPUA"
 }
-
-/// getrandom v0.3 custom backend (`getrandom_backend="custom"` in the target
-/// rustflags): AROS posixc provides a host-backed arc4random_buf CSPRNG.
-#[unsafe(no_mangle)]
-unsafe extern "Rust" fn __getrandom_v03_custom(
-    dest: *mut u8,
-    len: usize,
-) -> Result<(), getrandom::Error> {
-    unsafe extern "C" {
-        fn arc4random_buf(buf: *mut core::ffi::c_void, nbytes: usize);
-    }
-    unsafe { arc4random_buf(dest.cast(), len) };
-    Ok(())
-}
