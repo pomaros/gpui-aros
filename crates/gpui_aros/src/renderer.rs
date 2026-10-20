@@ -195,6 +195,7 @@ impl CpuRenderer {
             y1: self.pixmap.height() as i32,
         };
         let current = damage::capture(scene);
+        crate::stats::scene(scene.quads.len(), scene.monochrome_sprites.len(), current.len());
         let damage = if self.prev_frame.is_empty() {
             Some(full)
         } else {

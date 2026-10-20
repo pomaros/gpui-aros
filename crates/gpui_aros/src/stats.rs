@@ -46,6 +46,8 @@ struct Stats {
     events: u32,
     kinds: [(&'static str, Sample); 6],
     widest: DamageRect,
+    /// Primitives in the last scene drawn: (quads, monochrome sprites, all).
+    scene: (usize, usize, usize),
     last_report: Option<Instant>,
 }
 
@@ -67,6 +69,7 @@ impl Default for Stats {
                 ("PolychromeSprites", Sample::default()),
             ],
             widest: DamageRect::EMPTY,
+            scene: (0, 0, 0),
             last_report: None,
         }
     }
@@ -106,6 +109,11 @@ pub(crate) fn painted(raster: Duration, blit: Duration, damage: DamageRect) {
     });
 }
 
+/// The size of the scene GPUI handed over (whether or not it changed).
+pub(crate) fn scene(quads: usize, mono: usize, all: usize) {
+    STATS.with(|s| s.borrow_mut().scene = (quads, mono, all));
+}
+
 /// One primitive of `kind` rasterized in `d`.
 pub(crate) fn kind(kind: &'static str, d: Duration) {
     STATS.with(|s| {
@@ -141,8 +149,15 @@ fn report() {
             .filter(|(_, v)| v.count > 0)
             .map(|(k, v)| format!("{k}={}x{:.1}ms", v.count, v.total.as_secs_f64() * 1000.0))
             .collect();
+        let text = crate::text_stats::take();
+        let text: Vec<String> = crate::text_stats::METHODS
+            .iter()
+            .zip(text.iter())
+            .filter(|(_, c)| c.count > 0)
+            .map(|(m, c)| format!("{m}={}x{:.1}ms", c.count, c.total.as_secs_f64() * 1000.0))
+            .collect();
         log::info!(
-            "gpui_aros frames={} draw avg={:.1}ms max={:.1}ms | painted={} raster avg={:.1}ms max={:.1}ms blit avg={:.1}ms max={:.1}ms px/paint={} widest={:?} kinds[{}] | identical={} events={}",
+            "gpui_aros frames={} draw avg={:.1}ms max={:.1}ms | painted={} raster avg={:.1}ms max={:.1}ms blit avg={:.1}ms max={:.1}ms px/paint={} widest={:?} kinds[{}] | scene quads={} glyphs={} all={} | text[{}] | identical={} events={}",
             s.frame.count,
             s.frame.avg_ms(),
             s.frame.max.as_secs_f64() * 1000.0,
@@ -154,6 +169,10 @@ fn report() {
             if s.raster.count == 0 { 0 } else { s.damage_px / s.raster.count as u64 },
             s.widest,
             kinds.join(" "),
+            s.scene.0,
+            s.scene.1,
+            s.scene.2,
+            text.join(" "),
             s.skipped,
             s.events,
         );

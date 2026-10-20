@@ -31,6 +31,7 @@ version. The Zed application itself will consume the backend through a
 | `src/window.rs` | `ArosWindow`: Intuition window, callbacks, `draw`, event pump |
 | `src/renderer.rs` | `CpuRenderer`: tiny-skia rasterizer, one arm per `PrimitiveBatch` |
 | `src/damage.rs` | frame fingerprints and the dirty rectangle |
+| `src/stats.rs`, `src/text_stats.rs` | frame statistics through `log` every two seconds: GPUI draw, raster and blit time, damaged pixels, time per primitive kind, scene size, text-system calls |
 | `src/atlas.rs` | `CpuAtlas`: etagere shelf packing over `Vec<u8>` textures |
 | `src/dispatcher.rs` | std-thread background pool and the main-thread queue |
 | `src/display.rs` | one display from `gpa_screen_size` |
@@ -50,9 +51,16 @@ host: `cargo test -p gpui_aros` runs the conformance suite described in
 
 - **Rendering.** The drawable is the window interior at one device pixel per
   point (`scale_factor` is 1.0). Each frame is diffed against the previous
-  one; only the damaged rectangle is rasterized and blitted with
-  `WritePixelArray` in `RECTFMT_RGBA`, tiny-skia's byte order. Subpixel text
-  is off. There is no GPU path.
+  one (common prefix and suffix dropped, then a walk that resynchronises
+  after every change, so two changes far apart damage two small rectangles'
+  union); only the damaged rectangle is rasterized and blitted with
+  `WritePixelArray` in `RECTFMT_RGBA`, tiny-skia's byte order. Clips are
+  rectangles cut into the geometry; a pixel mask exists only for a rounded,
+  stroked, path or scaled primitive that straddles its clip. Tinted glyphs
+  are cached per tile and color. Subpixel text is off. There is no GPU
+  path. Measured on the M1 at 1400x900: about 1 ms of raster for a hovered
+  row, 4 to 10 ms for the whole window; GPUI's own layout and paint of a
+  file list costs more than that on the boot core.
 - **Run loop.** One frame per 33 ms at most: drain the main-thread queue,
   poll every window's IDCMP port, request frames, then `Wait()` on the union
   of the window signal masks and the dispatcher's wake signal.

@@ -16,6 +16,7 @@
 //! binary, which would break `cargo test` on the host.
 
 mod stats;
+mod text_stats;
 mod atlas;
 mod damage;
 pub mod input;

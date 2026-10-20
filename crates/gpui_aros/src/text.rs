@@ -28,5 +28,5 @@ pub(crate) fn new_text_system() -> Arc<dyn PlatformTextSystem> {
     if let Err(error) = text_system.add_fonts(fonts) {
         log::error!("gpui_aros: failed to load bundled fonts: {error:#}");
     }
-    Arc::new(text_system)
+    Arc::new(crate::text_stats::TimedTextSystem(Arc::new(text_system)))
 }
