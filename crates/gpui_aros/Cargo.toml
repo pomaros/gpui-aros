@@ -1,40 +1,48 @@
+# The GPUI platform backend for AROS, on the `gpui-pre` crates.io identity.
+#
+# Standalone on purpose (the Zed workspace excludes it): consumers such as
+# Ferail depend on GPUI through the `gpui-pre-*` 0.3.8 snapshots of Zed
+# 279fe07, and a backend built against this workspace's path `gpui` would be a
+# second, incompatible GPUI in their graph. The Zed application itself will
+# consume it through a `gpui-pre` shim over its path crates when its own AROS
+# build is restored. Swapped in by `[patch.crates-io] gpui-pre-platform` ->
+# ../gpui_platform_aros, which depends on this crate.
+
 [package]
 name = "gpui_aros"
 version = "0.1.0"
-publish.workspace = true
-edition.workspace = true
+edition = "2024"
+publish = false
 license = "Apache-2.0"
-
-[lints]
-workspace = true
 
 [lib]
 path = "src/gpui_aros.rs"
 
-# Host-compilable core (atlas / renderer / input) — the porting
+# Host-compilable core (atlas / renderer / input / damage): the porting
 # conformance suite runs these under plain `cargo test -p gpui_aros`
 # on any host (see PORTING.md).
 [dependencies]
-gpui.workspace = true
-anyhow.workspace = true
-collections.workspace = true
+gpui = { package = "gpui-pre", version = "=0.3.8", default-features = false }
+anyhow = "1.0.86"
+collections = { package = "gpui-pre-collections", version = "=0.3.8" }
 etagere = "0.2"
-parking_lot.workspace = true
+parking_lot = "0.12.1"
 tiny-skia = "0.11"
 
 # AROS-only shell (window / platform / dispatcher / text).
 [target.'cfg(target_os = "aros")'.dependencies]
-gpui_wgpu.workspace = true
+# Only for `CosmicTextSystem` (cosmic-text / swash / fontdb, OS-independent).
+gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.8" }
 crossbeam-channel = "0.5"
-futures.workspace = true
-log.workspace = true
-smallvec.workspace = true
-# Pure helpers only — this crate uses no `util::` item that needs the smol
-# `process` half, and taking the default would unify the async-io reactor back
-# into an embedder's graph (see the root manifest's http_client note).
-util = { path = "../util", default-features = false }
-uuid.workspace = true
+futures = "0.3.32"
+log = "0.4.16"
+smallvec = { version = "1.6", features = ["union", "const_new"] }
+uuid = { version = "1.1.2", features = ["v4"] }
 raw-window-handle = "0.6"
 
 [build-dependencies]
 cc = "1"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ['cfg(target_os, values("aros"))']

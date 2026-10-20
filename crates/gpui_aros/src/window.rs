@@ -13,7 +13,7 @@ use gpui::{
     MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
     Scene, ScrollDelta, ScrollWheelEvent, Size, TouchPhase, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams, px,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams, WindowVisibility, px,
 };
 use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, WindowHandle,
@@ -35,17 +35,13 @@ struct ArosWindowCallbacks {
     should_close: Option<Box<dyn FnMut() -> bool>>,
     close: Option<Box<dyn FnOnce()>>,
     appearance_changed: Option<Box<dyn FnMut()>>,
+    visibility_change: Option<Box<dyn FnMut(WindowVisibility)>>,
     hit_test_window_control: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
 }
 
 struct ArosWindowState {
     handle: *mut c_void,
     renderer: CpuRenderer,
-    /// Physical-pixels-per-logical-point for the drawable. 1.0 = the normal
-    /// direct-blit path. < 1.0 = opt-in dynamic-resolution present: gpui
-    /// renders into a smaller drawable and gpufx GPU-upscales it to the window
-    /// (GPUI_AROS_RENDER_SCALE, only when gpufx.library is available).
-    render_scale: f32,
     bounds: Bounds<Pixels>,
     title: String,
     input_handler: Option<PlatformInputHandler>,
@@ -125,19 +121,15 @@ impl ArosWindow {
             anyhow::bail!("gpa_open_window failed");
         }
 
-        // Opt-in dynamic-resolution present: render into a smaller drawable and
-        // GPU-upscale via gpufx. Only honored when gpufx.library is available;
-        // clamped to [0.25, 1.0]. Default 1.0 = the normal direct-blit path.
-        let render_scale = dynres_scale();
-
-        let device_size = scaled_device_size(width, height, render_scale);
+        // The drawable is the window interior, one device pixel per point:
+        // the CPU renderer blits straight into the RastPort.
+        let device_size = device_size(width, height);
         let renderer = CpuRenderer::new(device_size);
         let atlas: Arc<dyn PlatformAtlas> = renderer.sprite_atlas();
 
         let state = ArosWindowState {
             handle: raw,
             renderer,
-            render_scale,
             bounds,
             title,
             input_handler: None,
@@ -557,19 +549,15 @@ impl ArosWindowInner {
             width: px(w as f32),
             height: px(h as f32),
         };
-        let render_scale = {
+        {
             let mut state = self.state.borrow_mut();
             state.bounds.size = size;
-            let dev = scaled_device_size(w, h, state.render_scale);
-            state.renderer.update_drawable_size(dev);
-            state.render_scale
-        };
+            state.renderer.update_drawable_size(device_size(w, h));
+        }
         let taken = self.callbacks.borrow_mut().resize.take();
         if let Some(mut f) = taken {
-            // Report the same factor `scale_factor()` returns — hard-coding
-            // 1.0 here made the first resize tell GPUI the drawable was
-            // 1:1 even in dynamic-resolution mode (render_scale < 1.0).
-            f(size, render_scale);
+            // The same factor `scale_factor()` returns.
+            f(size, SCALE_FACTOR);
             self.callbacks.borrow_mut().resize = Some(f);
         }
     }
@@ -597,27 +585,14 @@ impl ArosWindowInner {
     }
 }
 
-/// Resolve the opt-in render scale: `GPUI_AROS_RENDER_SCALE` in [0.25, 1.0],
-/// honored only when gpufx.library is present (dynamic-resolution needs the GPU
-/// upscale). Anything else -> 1.0 (the normal direct-blit path).
-fn dynres_scale() -> f32 {
-    let requested = std::env::var("GPUI_AROS_RENDER_SCALE")
-        .ok()
-        .and_then(|s| s.trim().parse::<f32>().ok())
-        .map(|s| s.clamp(0.25, 1.0))
-        .unwrap_or(1.0);
-    if requested < 1.0 && unsafe { glue::gpa_gpufx_available() } == 1 {
-        requested
-    } else {
-        1.0
-    }
-}
+/// Device pixels per logical point. The window interior is the drawable.
+const SCALE_FACTOR: f32 = 1.0;
 
-/// Drawable (pixmap) size for a window inner size at the given render scale.
-fn scaled_device_size(inner_w: i32, inner_h: i32, scale: f32) -> Size<DevicePixels> {
+/// Drawable (pixmap) size for a window inner size.
+fn device_size(inner_w: i32, inner_h: i32) -> Size<DevicePixels> {
     Size {
-        width: DevicePixels(((inner_w as f32 * scale).round() as i32).max(1)),
-        height: DevicePixels(((inner_h as f32 * scale).round() as i32).max(1)),
+        width: DevicePixels(inner_w.max(1)),
+        height: DevicePixels(inner_h.max(1)),
     }
 }
 
@@ -668,9 +643,7 @@ impl PlatformWindow for ArosWindow {
     }
 
     fn scale_factor(&self) -> f32 {
-        // Physical drawable pixels per logical point. 1.0 normally; < 1.0 in
-        // dynamic-resolution mode (gpui renders fewer pixels, gpufx upscales).
-        self.inner.state.borrow().render_scale
+        SCALE_FACTOR
     }
 
     fn appearance(&self) -> WindowAppearance {
@@ -787,6 +760,20 @@ impl PlatformWindow for ArosWindow {
         self.inner.callbacks.borrow_mut().close = Some(callback);
     }
 
+    /// An open Intuition window is presented; Intuition reports no
+    /// obscured or iconified state for it, so it is `Hidden` only once closed.
+    fn visibility(&self) -> WindowVisibility {
+        if self.inner.state.borrow().closed {
+            WindowVisibility::Hidden
+        } else {
+            WindowVisibility::Visible
+        }
+    }
+
+    fn on_visibility_change(&self, callback: Box<dyn FnMut(WindowVisibility)>) {
+        self.inner.callbacks.borrow_mut().visibility_change = Some(callback);
+    }
+
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>) {
         self.inner.callbacks.borrow_mut().appearance_changed = Some(callback);
     }
@@ -803,43 +790,9 @@ impl PlatformWindow for ArosWindow {
             return;
         };
         let dev_w = state.renderer.width() as i32;
-        let dev_h = state.renderer.height() as i32;
         let stride = dev_w * 4;
         let handle = state.handle;
         let data = state.renderer.framebuffer();
-
-        if state.render_scale < 1.0 {
-            // Dynamic-resolution present: the drawable is smaller than the
-            // window, so GPU-upscale the whole (freshly-diffed) framebuffer to
-            // the window via gpufx. The damage rect is in drawable space and a
-            // partial upscale would need remapping; a full upscale is ~1-3ms
-            // and only runs when something changed. Fall back to a direct blit
-            // if the GPU path refuses (keeps pixels correct, if unscaled).
-            let inner = state.bounds.size;
-            let inner_w = f32::from(inner.width).round() as i32;
-            let inner_h = f32::from(inner.height).round() as i32;
-            // SAFETY: valid handle; data is dev_w*dev_h*4 tightly-rowed RGBA.
-            let done = unsafe {
-                glue::gpa_blit_scaled(
-                    handle,
-                    data.as_ptr() as *const c_void,
-                    stride,
-                    dev_w,
-                    dev_h,
-                    inner_w,
-                    inner_h,
-                )
-            };
-            if done == 1 {
-                return;
-            }
-            // Fallback: blit the small buffer 1:1 (top-left) — degraded but
-            // never wrong pixels; only reached if gpufx vanished mid-run.
-            unsafe {
-                glue::gpa_blit(handle, data.as_ptr() as *const c_void, stride, 0, 0, dev_w, dev_h);
-            }
-            return;
-        }
 
         // SAFETY: valid handle; data is the full framebuffer, and the glue
         // blits the (x, y, w, h) subrect out of it (same stride).

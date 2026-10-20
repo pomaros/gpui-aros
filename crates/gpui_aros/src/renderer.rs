@@ -379,7 +379,7 @@ impl CpuRenderer {
         let dst = sprite_pixmap.data_mut();
         for (src, out) in tile.data.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
             let (b, g, r, a) = (src[0] as f32, src[1] as f32, src[2] as f32, src[3] as f32);
-            let (r, g, b) = if sprite.grayscale {
+            let (r, g, b) = if sprite.grayscale == true.into() {
                 // Premultiplied channels share the pixel's alpha, so the
                 // luma weights apply directly.
                 let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
@@ -509,7 +509,7 @@ impl CpuRenderer {
         let b = &underline.bounds;
         let thickness = underline.thickness.0.max(0.5);
 
-        if underline.wavy == 0 {
+        if underline.wavy == false.into() {
             if let Some(rect) = Rect::from_xywh(
                 b.origin.x.0,
                 b.origin.y.0,
@@ -757,6 +757,37 @@ fn rounded_rect_path(
 /// A tiny-skia paint for a gpui `Background`: solid colors and two-stop
 /// linear gradients (interpolated in sRGB — the Oklab color-space option is
 /// approximated by sRGB, acceptable for the subtle UI fades gpui uses).
+/// `gpui::Background` with its `repr(C)` layout spelled out. GPUI's GPU
+/// backends upload the struct bytes to their shaders, so the layout (tag,
+/// colour space, solid colour, angle, two stops, padding) is a stable
+/// contract; the fields themselves are crate-private, so the CPU renderer
+/// reads a gradient through this mirror.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BackgroundRepr {
+    tag: u32,
+    color_space: u32,
+    solid: Hsla,
+    gradient_angle_or_pattern_height: f32,
+    colors: [gpui::LinearColorStop; 2],
+    pad: u32,
+}
+
+const BACKGROUND_TAG_LINEAR_GRADIENT: u32 = 1;
+
+const _: () = assert!(
+    std::mem::size_of::<BackgroundRepr>() == std::mem::size_of::<gpui::Background>()
+        && std::mem::align_of::<BackgroundRepr>() == std::mem::align_of::<gpui::Background>()
+);
+
+/// The angle (CSS degrees) and the two stops of a linear-gradient background.
+fn linear_gradient(background: &gpui::Background) -> Option<(f32, [gpui::LinearColorStop; 2])> {
+    // SAFETY: both types are repr(C) with the same size and alignment (checked
+    // above) and the same field sequence; reading a copy cannot alias anything.
+    let repr: BackgroundRepr = unsafe { std::ptr::read(background as *const gpui::Background as *const BackgroundRepr) };
+    (repr.tag == BACKGROUND_TAG_LINEAR_GRADIENT).then_some((repr.gradient_angle_or_pattern_height, repr.colors))
+}
+
 /// `None` for fully transparent fills and the pattern tags (slash /
 /// checkerboard: no public accessor yet, and unused by app chrome).
 fn background_paint<'a>(
@@ -769,7 +800,7 @@ fn background_paint<'a>(
         }
         return Some(solid_paint(color));
     }
-    let (angle_deg, stops) = background.as_linear_gradient()?;
+    let (angle_deg, stops) = linear_gradient(background)?;
 
     // CSS convention: 0deg points up, angles run clockwise. The gradient
     // line passes through the box center; its half-length is the projection

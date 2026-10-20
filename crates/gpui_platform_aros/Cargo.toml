@@ -1,0 +1,62 @@
+# AROS fork of the crates.io package gpui-pre-platform 0.3.8 (Zed gpui_platform
+# at 279fe07): the published manifest plus the AROS backend dependency. Not a
+# member of the Zed workspace (see the root manifest's `exclude`): it resolves
+# GPUI from the `gpui-pre` crates.io snapshots, the identity Ferail builds
+# against, and is swapped in through `[patch.crates-io]`.
+
+[package]
+edition = "2024"
+name = "gpui-pre-platform"
+version = "0.3.8"
+publish = false
+description = "AROS fork of Zed's `gpui_platform` crate (gpui-pre snapshot of zed@279fe07)"
+license = "Apache-2.0"
+repository = "https://github.com/zed-industries/zed"
+
+[package.metadata.gpui-pre]
+zed-crate = "gpui_platform"
+zed-version = "0.1.0"
+zed-rev = "279fe070bb389b79652e52065b2f001edcc0b11b"
+
+[features]
+bench-support = ["gpui/bench-support", "gpui_macos/bench-support", "gpui_wgpu/bench-support"]
+default = []
+font-kit = ["gpui_macos/font-kit"]
+inspector = ["gpui/inspector"]
+runtime_shaders = ["gpui_macos/runtime_shaders"]
+screen-capture = ["gpui/screen-capture", "gpui_macos/screen-capture", "gpui_windows/screen-capture", "gpui_linux/screen-capture"]
+test-support = ["gpui/test-support", "gpui_macos/test-support", "gpui_windows/test-support", "gpui_wgpu/test-support"]
+wayland = ["gpui_linux/wayland"]
+x11 = ["gpui_linux/x11"]
+
+[lib]
+name = "gpui_platform"
+path = "src/gpui_platform.rs"
+doctest = false
+
+[dependencies]
+anyhow = "1.0.86"
+gpui = { package = "gpui-pre", version = "=0.3.8", default-features = false }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+gpui_linux = { package = "gpui-pre-linux", version = "=0.3.8", default-features = false }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+console_error_panic_hook = "0.1.7"
+gpui_web = { package = "gpui-pre-web", version = "=0.3.8" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.8", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_macos = { package = "gpui-pre-macos", version = "=0.3.8", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.8", default-features = false, features = ["windows-manifest"] }
+gpui_windows = { package = "gpui-pre-windows", version = "=0.3.8", default-features = false }
+
+[target.'cfg(target_os = "aros")'.dependencies]
+gpui_aros = { path = "../gpui_aros" }
+
+[lints.rust.unexpected_cfgs]
+level = "allow"

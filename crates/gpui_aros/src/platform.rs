@@ -1,6 +1,7 @@
 //! The AROS platform: owns the run loop, dispatcher, display and text system.
 
 use std::cell::{Cell, RefCell};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use futures::channel::oneshot;
 use gpui::{
-    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DummyKeyboardMapper,
+    Action, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DummyKeyboardMapper,
     ForegroundExecutor, Keymap, Menu, MenuItem, PathPromptOptions, Platform, PlatformDisplay,
     PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, Task,
     ThermalState, WindowAppearance, WindowParams,
@@ -27,7 +28,9 @@ const FRAME_INTERVAL_MS: i32 = 33;
 #[derive(Default)]
 struct PlatformCallbacks {
     open_urls: Option<Box<dyn FnMut(Vec<String>)>>,
-    quit: Option<Box<dyn FnMut()>>,
+    quit: Option<Box<dyn FnMut() -> bool>>,
+    system_sleep: Option<Box<dyn FnMut()>>,
+    system_wake: Option<Box<dyn FnMut()>>,
     reopen: Option<Box<dyn FnMut()>>,
     will_open_app_menu: Option<Box<dyn FnMut()>>,
     validate_app_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
@@ -177,7 +180,7 @@ impl Platform for ArosPlatform {
         self.quit_requested.set(true);
     }
 
-    fn restart(&self, _binary_path: Option<PathBuf>) {}
+    fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<OsString>) {}
 
     fn activate(&self, _ignoring_other_apps: bool) {}
 
@@ -276,8 +279,26 @@ impl Platform for ArosPlatform {
 
     fn open_with_system(&self, _path: &Path) {}
 
-    fn on_quit(&self, callback: Box<dyn FnMut()>) {
+    fn on_quit(&self, callback: Box<dyn FnMut() -> bool>) {
         self.callbacks.borrow_mut().quit = Some(callback);
+    }
+
+    /// AROS exposes no system sleep or wake notification to a program; the
+    /// callbacks are kept and never fire.
+    fn on_system_sleep(&self, callback: Box<dyn FnMut()>) {
+        self.callbacks.borrow_mut().system_sleep = Some(callback);
+    }
+
+    fn on_system_wake(&self, callback: Box<dyn FnMut()>) {
+        self.callbacks.borrow_mut().system_wake = Some(callback);
+    }
+
+    /// Idle-sleep inhibition is not available on AROS: the caller learns it
+    /// from the error instead of holding a guard that does nothing.
+    fn prevent_idle_sleep(&self, reason: &str) -> Task<Result<ActivityGuard>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "idle sleep inhibition is not available on AROS (requested for: {reason})"
+        )))
     }
 
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {

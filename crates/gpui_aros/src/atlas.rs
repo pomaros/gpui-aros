@@ -117,11 +117,11 @@ impl CpuAtlas {
 impl PlatformAtlas for CpuAtlas {
     fn get_or_insert_with<'a>(
         &self,
-        key: &AtlasKey,
+        key: AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>> {
         let mut state = self.0.lock();
-        if let Some(tile) = state.tiles_by_key.get(key) {
+        if let Some(tile) = state.tiles_by_key.get(&key) {
             return Ok(Some(*tile));
         }
         let Some((size, bytes)) = build()? else {
@@ -131,7 +131,7 @@ impl PlatformAtlas for CpuAtlas {
             .allocate(size, key.texture_kind())
             .context("failed to allocate atlas tile")?;
         state.upload(tile.texture_id, tile.bounds, &bytes);
-        state.tiles_by_key.insert(key.clone(), tile);
+        state.tiles_by_key.insert(key, tile);
         Ok(Some(tile))
     }
 

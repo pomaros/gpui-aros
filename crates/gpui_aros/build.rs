@@ -1,39 +1,41 @@
 //! Build script for gpui_aros.
 //!
-//! The C glue (`c/gpui_aros_glue.c`) wraps AROS Intuition/CyberGraphics. It is
-//! only compiled when targeting AROS *and* the AROS SDK proto headers are
-//! present. Those headers live in the canonical build tree (stable location
-//! `$AROS_BUILD`, default `~/aros-build`; the old `/tmp/arosbuild` copy gets
-//! eaten by the macOS periodic /tmp cleaner). When they are absent we skip the
-//! cc invocation so that a plain `cargo check` still succeeds — the final
-//! runnable AROS binary links the glue object via collect-aros at link time
-//! (like hosted/feraille).
+//! The C glue (`c/gpui_aros_glue.c`) wraps AROS Intuition/CyberGraphics. It
+//! is compiled only when targeting AROS *and* an AROS SDK is named by
+//! `AROS_SDK` (the `Developer` directory of a native AROS build, holding
+//! `include/proto/*.h` and `lib/*.a`). Without it the cc invocation is
+//! skipped so that a plain `cargo check` still succeeds; the runnable AROS
+//! command then links the glue object itself at collect-aros time.
+//!
+//! The C compiler, archiver and flags come from the cc crate's ordinary
+//! target-suffixed environment (`CC_aarch64_unknown_aros`,
+//! `AR_aarch64_unknown_aros`, `CFLAGS_aarch64_unknown_aros`), which the
+//! consumer's AROS cargo config sets. Native AROS treats x18 as an ordinary
+//! register; nothing here reserves it.
 use std::env;
 use std::path::Path;
 
 fn main() {
     println!("cargo:rerun-if-changed=c/gpui_aros_glue.c");
+    println!("cargo:rerun-if-env-changed=AROS_SDK");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os != "aros" {
         return;
     }
 
-    // The headers the glue needs, produced by the AROS OS build. Probe every
-    // include root the glue reaches (proto/, exec/, devices/, …) — the /tmp
-    // tree gets GC'd piecemeal, so a single surviving file (it happens:
-    // proto/exec.h outlived exec/types.h once) must not trick us into a
-    // doomed cc invocation.
-    let aros_build = env::var("AROS_BUILD").unwrap_or_else(|_| {
-        format!("{}/aros-build", env::var("HOME").unwrap_or_default())
-    });
-    let include_root = format!("{aros_build}/bin/darwin-aarch64/gen/include");
-    let include_root = include_root.as_str();
+    let Ok(sdk) = env::var("AROS_SDK") else {
+        println!("cargo:warning=gpui_aros glue deferred to link time (AROS_SDK not set)");
+        return;
+    };
+    let include_root = format!("{sdk}/include");
     let probes = [
         "proto/exec.h",
         "proto/intuition.h",
         "proto/cybergraphics.h",
         "proto/keymap.h",
+        "proto/gadtools.h",
+        "proto/asl.h",
         "exec/types.h",
         "devices/inputevent.h",
         "intuition/intuition.h",
@@ -41,31 +43,23 @@ fn main() {
     ];
     if let Some(missing) = probes
         .iter()
-        .find(|p| !Path::new(include_root).join(p).exists())
+        .find(|p| !Path::new(&include_root).join(p).exists())
     {
         println!(
-            "cargo:warning=gpui_aros glue deferred to link time (SDK header {missing} absent)"
+            "cargo:warning=gpui_aros glue deferred to link time (SDK header {missing} absent under {include_root})"
         );
         return;
     }
 
-    // CC + the base CFLAGS (crosstools clang, aros triple, large code model, x18
-    // reserved) come from hosted/zed/aros-env.sh (sourced before the build). The
-    // SDK include roots and the llvm-ar archiver (Apple ar silently makes empty
-    // archives from ELF objects) are also set here from $AROS_BUILD /
-    // $AROS_CROSSTOOLS (default ~/aros-build, ~/aros-crosstools) so the glue
-    // compiles even if the env recipe was not sourced. -Wno-pointer-sign matches
-    // the AROS C convention (STRPTR is unsigned char*; literals are plain char*).
-    let aros_crosstools = env::var("AROS_CROSSTOOLS").unwrap_or_else(|_| {
-        format!("{}/aros-crosstools", env::var("HOME").unwrap_or_default())
-    });
+    // -Wno-pointer-sign matches the AROS C convention (STRPTR is unsigned
+    // char*; literals are plain char*). AROS commands are relocatable
+    // objects: no PIC.
     cc::Build::new()
         .file("c/gpui_aros_glue.c")
-        .archiver(format!("{aros_crosstools}/bin/llvm-ar"))
+        .pic(false)
         .flag("-Wno-pointer-sign")
-        .include(include_root)
+        .include(&include_root)
         .include(format!("{include_root}/aros/posixc"))
         .include(format!("{include_root}/aros/stdc"))
-        .include(format!("{aros_build}/bin/darwin-aarch64/AROS/Developer/include"))
         .compile("gpui_aros_glue");
 }

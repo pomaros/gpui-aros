@@ -1,12 +1,9 @@
 [package]
 name = "gpui_aros_smoke"
 version = "0.1.0"
-publish.workspace = true
-edition.workspace = true
+publish = false
+edition = "2024"
 license = "Apache-2.0"
-
-[lints]
-workspace = true
 
 # A staticlib, linked into an AROS C: command by link-aros.sh (mirroring
 # hosted/rust/std-build.sh): C owns AROS startup and calls
@@ -15,10 +12,16 @@ workspace = true
 [lib]
 crate-type = ["staticlib"]
 
+# Standalone like gpui_aros (the Zed workspace excludes it): GPUI comes from
+# the `gpui-pre` crates.io snapshots and the platform crate is the AROS fork
+# of `gpui-pre-platform`, patched in below.
 [dependencies]
-gpui.workspace = true
-gpui_platform.workspace = true
-# The custom getrandom backend the .cargo/config selects for this target
-# (`getrandom_backend="custom"`) — the binary must provide
-# __getrandom_v03_custom; ours rides posixc arc4random_buf.
-getrandom = "0.3"
+gpui = { package = "gpui-pre", version = "=0.3.8", default-features = false }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8" }
+
+[patch.crates-io]
+gpui-pre-platform = { path = "../gpui_platform_aros" }
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ['cfg(target_os, values("aros"))']

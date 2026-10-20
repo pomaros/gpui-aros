@@ -251,7 +251,7 @@ pub(crate) fn fingerprint_underline(u: &Underline) -> Fingerprint {
         mask: u.content_mask.bounds,
         color: HslaBits(u.color),
         thickness: px_bits(u.thickness),
-        wavy: u.wavy,
+        wavy: (u.wavy == true.into()) as u32,
     })
 }
 
@@ -274,7 +274,7 @@ pub(crate) fn fingerprint_poly(s: &PolychromeSprite) -> Fingerprint {
         tile: s.tile,
         corner_radii: corners_bits(&s.corner_radii),
         opacity: s.opacity.to_bits(),
-        grayscale: s.grayscale,
+        grayscale: s.grayscale == true.into(),
     })
 }
 
