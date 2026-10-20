@@ -1,0 +1,97 @@
+# gpui_aros
+
+A GPUI platform backend for native AROS (AArch64): Intuition windows and
+input, a tiny-skia CPU rasterizer blitted through CyberGraphics, cosmic-text
+shaping with bundled fonts, `clipboard.device`, GadTools menus, ASL file
+requesters and Intuition pointers. Any GPUI application runs on it; Ferail is
+the first.
+
+## Identity and layout
+
+The crate builds against the `gpui-pre` crates.io snapshots of Zed
+(`gpui-pre`, `gpui-pre-collections`, `gpui-pre-wgpu` for the text system), the
+identity its consumers use, and is therefore **not** a member of the Zed
+workspace. Its sibling `../gpui_platform_aros` is the published
+`gpui-pre-platform` source plus one `target_os = "aros"` arm selecting
+`ArosPlatform`; a consumer swaps it in with
+
+```toml
+[patch.crates-io]
+gpui-pre-platform = { path = ".../zed-aros/crates/gpui_platform_aros" }
+```
+
+and keeps `gpui`, `gpui_platform` and gpui-component on the same snapshot
+version. The Zed application itself will consume the backend through a
+`gpui-pre` shim over its path crates when its AROS build is restored.
+
+| File | What |
+|---|---|
+| `src/gpui_aros.rs` | crate root; the AROS shell modules are `cfg(target_os = "aros")` |
+| `src/platform.rs` | `ArosPlatform`: run loop, `Platform` methods |
+| `src/window.rs` | `ArosWindow`: Intuition window, callbacks, `draw`, event pump |
+| `src/renderer.rs` | `CpuRenderer`: tiny-skia rasterizer, one arm per `PrimitiveBatch` |
+| `src/damage.rs` | frame fingerprints and the dirty rectangle |
+| `src/atlas.rs` | `CpuAtlas`: etagere shelf packing over `Vec<u8>` textures |
+| `src/dispatcher.rs` | std-thread background pool and the main-thread queue |
+| `src/display.rs` | one display from `gpa_screen_size` |
+| `src/input.rs` | RAWKEY to `Keystroke`, qualifiers to `Modifiers`, mouse |
+| `src/menus.rs` | GPUI menus to GadTools `NewMenu` strips, picks to actions |
+| `src/text.rs` | `CosmicTextSystem` with the bundled IBM Plex Sans and Lilex |
+| `src/glue.rs` | `extern "C"` declarations for the C glue |
+| `src/conformance.rs` | host-runnable renderer and input conformance tests |
+| `c/gpui_aros_glue.c` | flat C over Intuition, CyberGraphics, keymap, GadTools, ASL and `clipboard.device` |
+| `build.rs` | compiles the glue when targeting AROS with `AROS_SDK` set |
+
+`atlas`, `renderer`, `damage` and `input` are pure Rust and compile on any
+host: `cargo test -p gpui_aros` runs the conformance suite described in
+[PORTING.md](PORTING.md).
+
+## Platform contract
+
+- **Rendering.** The drawable is the window interior at one device pixel per
+  point (`scale_factor` is 1.0). Each frame is diffed against the previous
+  one; only the damaged rectangle is rasterized and blitted with
+  `WritePixelArray` in `RECTFMT_RGBA`, tiny-skia's byte order. Subpixel text
+  is off. There is no GPU path.
+- **Run loop.** One frame per 33 ms at most: drain the main-thread queue,
+  poll every window's IDCMP port, request frames, then `Wait()` on the union
+  of the window signal masks and the dispatcher's wake signal.
+- **Input.** RAWKEY codes go through `keymap.library` for the printable
+  character and the unmodified key name; the Amiga keys map to GPUI's
+  `platform` modifier, so `secondary-` bindings are Ctrl. Right-click reaches
+  the application only while it asks for it (`gpa_set_rmb_trap`), otherwise
+  Intuition's menu strip owns the button.
+- **Menus, requesters, pointers, clipboard.** `set_menus` builds a GadTools
+  strip; `prompt_for_paths` and `prompt_for_new_path` open an ASL requester
+  (synchronously, on the UI task); `set_cursor_style` installs an Intuition
+  pointer object; clipboard text is IFF FTXT in ISO-8859-1 on unit 0. Window
+  titles are folded to Latin-1 for the Intuition title font.
+- **Unavailable on AROS, reported as such.** `prevent_idle_sleep` returns an
+  error; the system sleep and wake callbacks are kept and never fire; window
+  visibility is `Visible` while open and `Hidden` once closed; `open_url`,
+  `restart`, `activate` and the other desktop-integration methods are no-ops.
+
+## Building
+
+The C glue is compiled by `build.rs` only when `CARGO_CFG_TARGET_OS` is
+`aros` and `AROS_SDK` names a native SDK `Developer` directory (with
+`include/proto/*.h`). The compiler, archiver and flags come from the cc
+crate's target-suffixed environment (`CC_aarch64_unknown_aros`,
+`AR_aarch64_unknown_aros`, `CFLAGS_aarch64_unknown_aros`), which the consumer's
+AROS cargo configuration sets: an ELF triple, `-fno-pic`, `-mcmodel=large`,
+no reserved x18 (native AROS uses it as an ordinary register). Without
+`AROS_SDK` a plain `cargo check` still passes and the glue is expected at the
+final link.
+
+Ferail's `scripts/aros-cargo.sh` is the reference invocation: the official
+pinned nightly with the AROS std overlay, the native target JSON and
+`-Zbuild-std`, plus the patched crate store. `../gpui_aros_smoke` is the
+minimal consumer: one window, every renderer primitive, keyboard echo.
+
+## Known limits
+
+- Pattern fills (slash, checkerboard), per-edge border widths other than the
+  tree connectors, sprite rotation and `Surfaces` (video) are not drawn.
+- The ASL requester blocks the UI task while open.
+- The dispatcher's worker count and priorities were tuned on a hosted,
+  single-CPU AROS; native SMP qualification is open.
