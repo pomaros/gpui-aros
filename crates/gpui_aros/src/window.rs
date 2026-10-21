@@ -450,7 +450,26 @@ impl ArosWindowInner {
             return;
         }
 
-        let Some(key) = key_name(down_code, &event.base_chars) else {
+        let key = key_name(down_code, &event.base_chars);
+        // GPUI_AROS_KEYLOG=1: every raw key as the backend sees it, to tell
+        // a key that never arrives from one GPUI does not bind.
+        static KEYLOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *KEYLOG.get_or_init(|| std::env::var_os("GPUI_AROS_KEYLOG").is_some_and(|v| !v.is_empty())) {
+            log::info!(
+                "gpui_aros key: code={:#04x} up={} qual={:#06x} chars={:?} base={:?} name={:?} ctrl={} alt={} shift={} cmd={}",
+                down_code,
+                is_up,
+                qualifier,
+                latin1_to_string(&event.chars),
+                latin1_to_string(&event.base_chars),
+                key,
+                modifiers.control,
+                modifiers.alt,
+                modifiers.shift,
+                modifiers.platform,
+            );
+        }
+        let Some(key) = key else {
             // Unmapped code (or a dead key waiting for its successor) —
             // nothing sensible to report.
             return;
