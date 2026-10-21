@@ -29,6 +29,7 @@
 #include <workbench/startup.h>
 
 #include <string.h>
+#include <stdio.h>
 #include <unistd.h>
 
 /* Library bases. The proto headers declare these extern; this module owns
@@ -1060,4 +1061,269 @@ int gpa_asl_request_paths(int save_mode, int drawers_only, int multiselect,
     }
     FreeAslRequest(fr);
     return rc;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Sampling profiler of the main task.
+ *
+ * A separate process at a higher priority wakes every interval, and while
+ * it runs the main task is switched out, its registers saved in its
+ * ETask's register frame: the sampler reads the program counter and the
+ * link register from there, and whether the task was waiting. Samples go
+ * to a buffer; gpa_profile_stop writes them to a file with a header that
+ * names the runtime address of gpa_profile_start, so a host can translate
+ * every sample to a symbol of the unstripped binary (the loader relocates
+ * .text as one block). Nothing here touches the main task's state. */
+#include <aros/aarch64/cpucontext.h>
+#include <exec/tasks.h>
+#include <dos/dostags.h>
+
+#include <proto/debug.h>
+#include <exec/resident.h>
+#include <exec/execbase.h>
+#include <libraries/debug.h>
+#include <utility/tagitem.h>
+
+#define GPA_FRAMES 8
+/* pc, lr, the frame-pointer chain's return addresses (0 when the chain
+ * leaves the task's stack or has no frame pointers), and the wait flag. */
+struct gpa_sample { unsigned long long pc, lr, frames[GPA_FRAMES]; unsigned int waiting, nframes; };
+
+#define GPA_PROFILE_MAX 200000
+
+static struct gpa_sample *gpa_prof_buf;
+static volatile unsigned long gpa_prof_count;
+static volatile int gpa_prof_stop;
+static struct Task *gpa_prof_task;
+static unsigned long gpa_prof_interval_us;
+
+static void gpa_profile_sampler(void)
+{
+    struct MsgPort *port = CreateMsgPort();
+    struct timerequest *req = port ? (struct timerequest *)CreateIORequest(port, sizeof(*req)) : NULL;
+    if (!req || OpenDevice("timer.device", UNIT_MICROHZ, (struct IORequest *)req, 0) != 0) {
+        gpa_prof_stop = 2;
+        return;
+    }
+    while (!gpa_prof_stop) {
+        struct ETask *et;
+        req->tr_node.io_Command = TR_ADDREQUEST;
+        req->tr_time.tv_secs = gpa_prof_interval_us / 1000000u;
+        req->tr_time.tv_micro = gpa_prof_interval_us % 1000000u;
+        DoIO((struct IORequest *)req);
+        if (!gpa_main_task || gpa_prof_count >= GPA_PROFILE_MAX)
+            continue;
+        et = GetETask(gpa_main_task);
+        if (et && et->et_RegFrame) {
+            struct ExceptionContext *ctx = (struct ExceptionContext *)et->et_RegFrame;
+            struct gpa_sample *s = &gpa_prof_buf[gpa_prof_count];
+            unsigned long long fp = ctx->fp;
+            unsigned long long lo = (unsigned long long)(IPTR)gpa_main_task->tc_SPLower;
+            unsigned long long hi = (unsigned long long)(IPTR)gpa_main_task->tc_SPUpper;
+            unsigned n = 0;
+            s->pc = ctx->pc;
+            s->lr = ctx->lr;
+            s->waiting = gpa_main_task->tc_State == TS_WAIT;
+            /* Walk the frame records while they stay inside the task's
+             * stack and move upwards; the saved task cannot run meanwhile. */
+            while (n < GPA_FRAMES && fp >= lo && fp + 16 <= hi && (fp & 7) == 0) {
+                unsigned long long *rec = (unsigned long long *)(IPTR)fp;
+                unsigned long long next = rec[0], ret = rec[1];
+                if (!ret)
+                    break;
+                s->frames[n++] = ret;
+                if (next <= fp)
+                    break;
+                fp = next;
+            }
+            s->nframes = n;
+            while (n < GPA_FRAMES)
+                s->frames[n++] = 0;
+            gpa_prof_count++;
+        }
+    }
+    CloseDevice((struct IORequest *)req);
+    DeleteIORequest((struct IORequest *)req);
+    DeleteMsgPort(port);
+    gpa_prof_stop = 3;
+}
+
+/* Start sampling the main task every interval_us microseconds. */
+int gpa_profile_start(unsigned long interval_us)
+{
+    if (gpa_prof_task || !gpa_main_task)
+        return 0;
+    gpa_prof_buf = AllocVec(sizeof(struct gpa_sample) * GPA_PROFILE_MAX, MEMF_ANY | MEMF_CLEAR);
+    if (!gpa_prof_buf)
+        return 0;
+    gpa_prof_count = 0;
+    gpa_prof_stop = 0;
+    gpa_prof_interval_us = interval_us < 200 ? 200 : interval_us;
+    gpa_prof_task = (struct Task *)CreateNewProcTags(NP_Entry, (IPTR)gpa_profile_sampler,
+        NP_Name, (IPTR)"gpui_aros profiler", NP_Priority, 10, NP_StackSize, 32768, TAG_DONE);
+    return gpa_prof_task != NULL;
+}
+
+/* Name every distinct address of the samples through debug.library and
+ * append "sym <addr> <module> <symbol>+<offset>" lines after the samples:
+ * the kernel's and the libraries' code has no symbols the host could read. */
+static void gpa_profile_write_symbols(BPTR fh, unsigned long n)
+{
+    struct Library *DebugBase = OpenLibrary("debug.library", 0);
+    unsigned long long *seen;
+    unsigned long nseen = 0, i, j;
+    const unsigned long cap = 8192;
+    if (!DebugBase)
+        return;
+    seen = AllocVec(sizeof(*seen) * cap, MEMF_ANY);
+    if (!seen) {
+        CloseLibrary(DebugBase);
+        return;
+    }
+    for (i = 0; i < n && nseen < cap; i++) {
+        unsigned k;
+        for (k = 0; k < 2 + gpa_prof_buf[i].nframes && nseen < cap; k++) {
+            unsigned long long a = k == 0 ? gpa_prof_buf[i].pc : k == 1 ? gpa_prof_buf[i].lr : gpa_prof_buf[i].frames[k - 2];
+            unsigned long long key = a & ~0xfULL; /* 16-byte buckets keep the table small */
+            int dup = 0;
+            if (!a)
+                continue;
+            for (j = 0; j < nseen; j++)
+                if (seen[j] == key) { dup = 1; break; }
+            if (dup)
+                continue;
+            seen[nseen++] = key;
+            {
+                STRPTR module = NULL, symbol = NULL;
+                APTR start = NULL;
+                struct TagItem tags[] = {
+                    { DL_ModuleName, (IPTR)&module },
+                    { DL_SymbolName, (IPTR)&symbol },
+                    { DL_SymbolStart, (IPTR)&start },
+                    { TAG_DONE, 0 }
+                };
+                char line[320];
+                int len;
+                DecodeLocationA((void *)(IPTR)key, tags);
+                len = snprintf(line, sizeof line, "sym %llx %s %s+%llx\n", key,
+                               module ? (const char *)module : "?",
+                               symbol ? (const char *)symbol : "?",
+                               start ? key - (unsigned long long)(IPTR)start : 0ULL);
+                Write(fh, line, len);
+            }
+        }
+    }
+    FreeVec(seen);
+    CloseLibrary(DebugBase);
+}
+
+/* The resident modules with their code ranges, "mod <name> <start> <end>":
+ * exec, the kernel and the ROM libraries are not known to debug.library,
+ * but each Resident tag sits at the start of its module image and names
+ * the end. The host maps an address to the module and its offset to a
+ * symbol of the module's ELF from the build tree. */
+static void gpa_profile_write_modules(BPTR fh)
+{
+    IPTR *list = (IPTR *)SysBase->ResModules;
+    int guard = 0;
+    while (list && *list && guard++ < 4096) {
+        if (*list & 1) {
+            list = (IPTR *)(*list & ~(IPTR)1);
+            continue;
+        }
+        {
+            struct Resident *r = (struct Resident *)*list;
+            char line[200];
+            int len = snprintf(line, sizeof line, "mod %s %llx %llx\n",
+                               r->rt_Name ? (const char *)r->rt_Name : "?",
+                               (unsigned long long)(IPTR)r->rt_MatchTag,
+                               (unsigned long long)(IPTR)r->rt_EndSkip);
+            Write(fh, line, len);
+        }
+        list++;
+    }
+}
+
+/* "lvo <module> <n> <addr>": the runtime address of jump vector n of a
+ * ROM library or resource. The module's ELF names that function
+ * <Prefix>_<n>_<Name>, so the host anchors the module's code from it;
+ * the Resident tags only span their own structure. */
+static void gpa_profile_write_lvos(BPTR fh)
+{
+    static const char *const libraries[] = {
+        "exec.library", "dos.library", "utility.library", "graphics.library",
+        "intuition.library", "cybergraphics.library", "layers.library",
+        "keymap.library", "stdc.library", "posixc.library", "stdcio.library",
+        "expansion.library", "debug.library", NULL
+    };
+    static const char *const resources[] = { "kernel.resource", NULL };
+    int i;
+    for (i = 0; libraries[i]; i++) {
+        struct Library *lib = OpenLibrary(libraries[i], 0);
+        if (!lib)
+            continue;
+        {
+            char line[160];
+            int len = snprintf(line, sizeof line, "lvo %s 5 %llx\n", libraries[i],
+                               (unsigned long long)(IPTR)__AROS_GETVECADDR(lib, 5));
+            Write(fh, line, len);
+        }
+        CloseLibrary(lib);
+    }
+    for (i = 0; resources[i]; i++) {
+        APTR res = OpenResource(resources[i]);
+        char line[160];
+        int len;
+        if (!res)
+            continue;
+        len = snprintf(line, sizeof line, "lvo %s 10 %llx\n", resources[i],
+                       (unsigned long long)(IPTR)__AROS_GETVECADDR(res, 10));
+        Write(fh, line, len);
+    }
+}
+
+static unsigned long gpa_profile_write(const char *path, int with_symbols)
+{
+    BPTR fh;
+    unsigned long n = gpa_prof_count;
+    fh = Open(path, MODE_NEWFILE);
+    if (fh) {
+        char header[160];
+        int len = snprintf(header, sizeof header,
+            "gpui-aros-profile-v2 start=%llx interval_us=%lu samples=%lu frames=%d\n",
+            (unsigned long long)(IPTR)&gpa_profile_start, gpa_prof_interval_us, n, GPA_FRAMES);
+        Write(fh, header, len);
+        Write(fh, gpa_prof_buf, sizeof(struct gpa_sample) * n);
+        gpa_profile_write_modules(fh);
+        gpa_profile_write_lvos(fh);
+        if (with_symbols)
+            gpa_profile_write_symbols(fh, n);
+        Close(fh);
+    }
+    return n;
+}
+
+/* Write the samples so far to path and keep sampling: the file is usable
+ * at any moment, not only after a clean exit. */
+unsigned long gpa_profile_flush(const char *path)
+{
+    if (!gpa_prof_task || !gpa_prof_buf)
+        return 0;
+    return gpa_profile_write(path, 0);
+}
+
+/* Stop sampling and write the samples to path. Returns the sample count. */
+unsigned long gpa_profile_stop(const char *path)
+{
+    unsigned long n;
+    if (!gpa_prof_task)
+        return 0;
+    gpa_prof_stop = 1;
+    while (gpa_prof_stop < 2)
+        Delay(1);
+    gpa_prof_task = NULL;
+    n = gpa_profile_write(path, 1);
+    FreeVec(gpa_prof_buf);
+    gpa_prof_buf = NULL;
+    return n;
 }

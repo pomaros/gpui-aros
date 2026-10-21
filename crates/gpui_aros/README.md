@@ -32,6 +32,7 @@ version. The Zed application itself will consume the backend through a
 | `src/renderer.rs` | `CpuRenderer`: tiny-skia rasterizer, one arm per `PrimitiveBatch` |
 | `src/damage.rs` | frame fingerprints and the dirty rectangle |
 | `src/stats.rs`, `src/text_stats.rs` | frame statistics through `log` every two seconds: GPUI draw, raster and blit time, damaged pixels, time per primitive kind, scene size, text-system calls |
+| `gpa_profile_*` in the glue | sampling profiler of the main task: `GPUI_AROS_PROFILE=<file>` samples its program counter every millisecond from its exec register frame and writes the samples at exit; `Ferail/scripts/aros-profile-symbolize.py` names them against the unstripped binary |
 | `src/atlas.rs` | `CpuAtlas`: etagere shelf packing over `Vec<u8>` textures |
 | `src/dispatcher.rs` | std-thread background pool and the main-thread queue |
 | `src/display.rs` | one display from `gpa_screen_size` |

@@ -1,5 +1,6 @@
 //! The AROS platform: owns the run loop, dispatcher, display and text system.
 
+use std::ffi::CString;
 use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -119,10 +120,33 @@ impl Platform for ArosPlatform {
     }
 
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) {
+        // GPUI_AROS_PROFILE=<file>: sample the main task's program counter
+        // every millisecond until the run loop ends, then write the samples
+        // to that file (symbolized on the host against the unstripped
+        // binary; see the README).
+        let profile = std::env::var_os("GPUI_AROS_PROFILE").filter(|v| !v.is_empty());
+        let profile_path = profile
+            .as_ref()
+            .and_then(|p| CString::new(p.to_string_lossy().into_owned()).ok());
+        if profile.is_some() {
+            // SAFETY: FFI; the main task is recorded by gpa_init_main.
+            let started = unsafe { crate::glue::gpa_profile_start(1000) };
+            log::info!("gpui_aros profile: sampler started={started}");
+        }
+        let mut profile_flushed = Instant::now();
         on_finish_launching();
 
         while !self.quit_requested.get() {
             let frame_start = Instant::now();
+            if let Some(path) = &profile_path {
+                // The samples so far every thirty seconds: a profile of a
+                // session that never ends cleanly is still a profile.
+                if profile_flushed.elapsed() >= Duration::from_secs(30) {
+                    profile_flushed = Instant::now();
+                    // SAFETY: FFI; the sampler is ours and the path is a C string.
+                    unsafe { crate::glue::gpa_profile_flush(path.as_ptr()) };
+                }
+            }
 
             self.drain_main_thread();
             if self.quit_requested.get() {
@@ -173,6 +197,11 @@ impl Platform for ArosPlatform {
         let on_quit = self.callbacks.borrow_mut().quit.take();
         if let Some(mut on_quit) = on_quit {
             on_quit();
+        }
+        if let Some(path) = profile_path {
+            // SAFETY: FFI; the sampler is ours and the path is a C string.
+            let n = unsafe { crate::glue::gpa_profile_stop(path.as_ptr()) };
+            log::info!("gpui_aros profile: {n} samples written");
         }
     }
 
