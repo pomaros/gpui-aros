@@ -45,15 +45,24 @@ enum QueueWait<T> {
     Closed,
 }
 
+// Stop admission without canceling async-task runnables while foreground
+// consumers are still being polled. Dropping a Runnable wakes its Task awaiter
+// with cancellation; the infallible Task future then panics when polled.
+enum QueueState<T> {
+    Open(VecDeque<T>),
+    Stopped(VecDeque<T>),
+    Released,
+}
+
 struct BlockingQueue<T> {
-    items: StdMutex<Option<VecDeque<T>>>, // None => closed
+    items: StdMutex<QueueState<T>>,
     ready: StdCondvar,
 }
 
 impl<T> BlockingQueue<T> {
     fn new() -> Self {
         Self {
-            items: StdMutex::new(Some(VecDeque::new())),
+            items: StdMutex::new(QueueState::Open(VecDeque::new())),
             ready: StdCondvar::new(),
         }
     }
@@ -61,29 +70,38 @@ impl<T> BlockingQueue<T> {
     /// Returns false if the queue is closed.
     fn push(&self, item: T) -> bool {
         let mut guard = self.items.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.as_mut() {
-            Some(q) => {
+        match &mut *guard {
+            QueueState::Open(q) => {
                 q.push_back(item);
                 drop(guard);
                 self.ready.notify_one();
                 true
             }
-            None => false,
+            QueueState::Stopped(retired) => {
+                retired.push_back(item);
+                false
+            }
+            QueueState::Released => {
+                // Destruction may reenter dispatch. Never drop under lock.
+                drop(guard);
+                drop(item);
+                false
+            }
         }
     }
 
-    /// Block until an item arrives; None once closed and drained.
+    /// Block until an item arrives; None once admission is stopped.
     fn pop(&self) -> Option<T> {
         let mut guard = self.items.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            match guard.as_mut() {
-                Some(q) => match q.pop_front() {
+            match &mut *guard {
+                QueueState::Open(q) => match q.pop_front() {
                     Some(item) => return Some(item),
                     None => {
                         guard = self.ready.wait(guard).unwrap_or_else(|e| e.into_inner());
                     }
                 },
-                None => return None,
+                QueueState::Stopped(_) | QueueState::Released => return None,
             }
         }
     }
@@ -92,7 +110,7 @@ impl<T> BlockingQueue<T> {
     /// turn a closed queue into a spin until its far-future deadline.
     fn pop_timeout(&self, timeout: Duration) -> QueueWait<T> {
         let mut guard = self.items.lock().unwrap_or_else(|error| error.into_inner());
-        let Some(items) = guard.as_mut() else {
+        let QueueState::Open(items) = &mut *guard else {
             return QueueWait::Closed;
         };
         if let Some(item) = items.pop_front() {
@@ -103,9 +121,9 @@ impl<T> BlockingQueue<T> {
             .wait_timeout(guard, timeout)
             .unwrap_or_else(|error| error.into_inner())
             .0;
-        match guard.as_mut() {
-            None => QueueWait::Closed,
-            Some(items) => match items.pop_front() {
+        match &mut *guard {
+            QueueState::Stopped(_) | QueueState::Released => QueueWait::Closed,
+            QueueState::Open(items) => match items.pop_front() {
                 Some(item) => QueueWait::Item(item),
                 None => QueueWait::TimedOut,
             },
@@ -113,21 +131,32 @@ impl<T> BlockingQueue<T> {
     }
 
     fn close(&self) {
-        let discarded = self
-            .items
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
+        let mut guard = self.items.lock().unwrap_or_else(|error| error.into_inner());
+        if let QueueState::Open(_) = &*guard {
+            let QueueState::Open(items) = std::mem::replace(&mut *guard, QueueState::Released)
+            else {
+                unreachable!();
+            };
+            *guard = QueueState::Stopped(items);
+        }
+        drop(guard);
         self.ready.notify_all();
-        // Runnable destruction may reenter dispatch. Never drop under lock.
-        drop(discarded);
+    }
+
+    /// Only after the foreground pump is closed and all producers joined.
+    fn release(&self) {
+        let retired = std::mem::replace(
+            &mut *self.items.lock().unwrap_or_else(|error| error.into_inner()),
+            QueueState::Released,
+        );
+        drop(retired);
     }
 
     fn is_closed(&self) -> bool {
-        self.items
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .is_none()
+        !matches!(
+            &*self.items.lock().unwrap_or_else(|error| error.into_inner()),
+            QueueState::Open(_)
+        )
     }
 }
 
@@ -310,6 +339,10 @@ impl ArosDispatcher {
             std::mem::take(&mut *queue)
         };
         drop(discarded);
+        // No foreground awaiter can run after this point. Cancellation wakes
+        // now discard its continuation instead of polling a canceled Task.
+        self.background_queue.release();
+        self.timer_queue.release();
     }
 
     /// Shared handle to the main-thread queue, drained by the run loop.
@@ -373,7 +406,7 @@ fn timer_loop(
     let mut seq: u64 = 0;
     loop {
         if queue.is_closed() {
-            return;
+            break;
         }
         // Fire everything already due.
         let now = Instant::now();
@@ -400,13 +433,13 @@ fn timer_loop(
                 match queue.pop_timeout(timeout) {
                     QueueWait::Item(item) => Some(item),
                     QueueWait::TimedOut => continue,
-                    QueueWait::Closed => return,
+                    QueueWait::Closed => break,
                 }
             }
             // Nothing pending: block. `None` means the queue closed (shutdown).
             None => match queue.pop() {
                 Some(item) => Some(item),
-                None => return,
+                None => break,
             },
         };
         if let Some((deadline, runnable)) = received {
@@ -417,6 +450,12 @@ fn timer_loop(
             });
             seq = seq.wrapping_add(1);
         }
+    }
+    // The timer thread must not cancel Tasks still awaited by foreground
+    // work. Retain timers without firing them early; the owner releases them
+    // after joining us and closing the foreground pump.
+    for entry in heap {
+        queue.push((entry.deadline, entry.runnable));
     }
 }
 
@@ -446,7 +485,7 @@ mod shutdown_tests {
     }
 
     #[test]
-    fn discarding_queued_values_can_reenter_without_queue_lock() {
+    fn releasing_retired_values_can_reenter_without_queue_lock() {
         struct Reenter(Arc<BlockingQueue<Reenter>>);
         impl Drop for Reenter {
             fn drop(&mut self) {
@@ -457,5 +496,30 @@ mod shutdown_tests {
         assert!(queue.push(Reenter(queue.clone())));
         queue.close();
         assert!(queue.is_closed());
+        queue.release();
+    }
+
+    #[test]
+    fn stopped_queue_retains_backlog_and_rejections_until_release() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Count(Arc<AtomicUsize>);
+        impl Drop for Count {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let queue = BlockingQueue::new();
+        assert!(queue.push(Count(drops.clone())));
+        queue.close();
+        assert!(!queue.push(Count(drops.clone())));
+        assert!(queue.pop().is_none());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        queue.close(); // stopping twice does not cancel retained work
+        queue.release();
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        assert!(!queue.push(Count(drops.clone())));
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+        queue.release(); // release is also idempotent
     }
 }
