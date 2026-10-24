@@ -65,7 +65,10 @@ host: `cargo test -p gpui_aros` runs the conformance suite described in
   file list costs more than that on the boot core.
 - **Run loop.** One frame per 33 ms at most: drain the main-thread queue,
   poll every window's IDCMP port, request frames, then `Wait()` on the union
-  of the window signal masks and the dispatcher's wake signal.
+  of the window signal masks and the dispatcher's wake signal. When the
+  loop ends, the quit callbacks run, the dispatcher joins its workers, and
+  the wake signal and the loop's timer go back to Exec, so the program
+  returns with no signal allocated.
 - **Input.** RAWKEY codes go through `keymap.library` for the printable
   character and the unmodified key name; the Amiga keys map to GPUI's
   `platform` modifier, so `secondary-` bindings are Ctrl. Right-click reaches
