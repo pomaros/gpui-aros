@@ -13,13 +13,17 @@ use std::ffi::CString;
 
 use gpui::{Action, Keymap, Menu, MenuItem};
 
+/// `FlatMenuItem::id` of a submenu header: no action, but a label (the C
+/// glue only turns `-1` entries into separator bars).
+pub(crate) const SUBMENU_ID: i32 = -2;
+
 /// One flattened menu entry, with its label/commkey storage. The CStrings
 /// stay alive for as long as the spec is stored, so the FFI array built in
 /// [`crate::window::ArosWindowInner::apply_menus`] can borrow them.
 pub(crate) struct FlatMenuItem {
     /// 0 = menu title, 1 = item, 2 = sub-item.
     pub level: i32,
-    /// Index into [`MenuState::actions`]; -1 = separator / not pickable.
+    /// Index into [`MenuState::actions`]; -1 = separator, [`SUBMENU_ID`] = submenu header.
     pub id: i32,
     pub label: CString,
     pub commkey: Option<CString>,
@@ -45,7 +49,9 @@ pub(crate) fn to_latin1(s: &str) -> Vec<u8> {
 }
 
 fn latin1_cstring(s: &str) -> CString {
-    let mut bytes = to_latin1(s);
+    // Fold the typographic characters menu labels use (the ellipsis of
+    // "Open Recent…") to ASCII instead of showing '?'.
+    let mut bytes = crate::input::to_latin1_lossy(s);
     bytes.retain(|&b| b != 0);
     // A latin-1 byte string with NULs stripped can't fail.
     CString::new(bytes).unwrap_or_default()
@@ -132,10 +138,12 @@ impl MenuState {
                 }
                 MenuItem::Submenu(submenu) => {
                     // Intuition menus nest exactly one level (item -> sub);
-                    // deeper trees flatten into the sub level.
+                    // deeper trees flatten into the sub level. The header
+                    // is not pickable but keeps its label: SUBMENU_ID, not
+                    // the separator's -1.
                     self.spec.push(FlatMenuItem {
                         level,
-                        id: -1,
+                        id: SUBMENU_ID,
                         label: latin1_cstring(&submenu.name),
                         commkey: None,
                         disabled: submenu.disabled,

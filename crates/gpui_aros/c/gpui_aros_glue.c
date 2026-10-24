@@ -870,7 +870,8 @@ int gpa_set_menus(void *handle, const GpaMenuSpec *specs, int count)
         n->nm_Type = (s->level <= 0) ? NM_TITLE
                      : (s->level == 1) ? NM_ITEM
                                        : NM_SUB;
-        if (s->id < 0 && s->level > 0) {
+        if (s->id == -1 && s->level > 0) {
+            /* -1 is a separator; a submenu header arrives as -2 with its label. */
             n->nm_Label = NM_BARLABEL;
         } else {
             char *copy = gpa_strdup(s->label ? s->label : "");
