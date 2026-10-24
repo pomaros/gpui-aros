@@ -74,6 +74,7 @@ enum {
     GPA_EVENT_MOUSEUP = 6,
     GPA_EVENT_RAWKEY = 7,
     GPA_EVENT_MENUPICK = 8, /* code = the item id passed to gpa_set_menus */
+    GPA_EVENT_ACTIVATE = 9, /* code = 1 window activated, 0 deactivated */
 };
 
 typedef struct GpaEvent {
@@ -312,7 +313,7 @@ void *gpa_open_window(int x, int y, int inner_w, int inner_h,
         WA_MaxHeight, 0xFFFF,
         WA_IDCMP, IDCMP_CLOSEWINDOW | IDCMP_NEWSIZE | IDCMP_REFRESHWINDOW
             | IDCMP_MOUSEBUTTONS | IDCMP_MOUSEMOVE | IDCMP_RAWKEY
-            | IDCMP_MENUPICK,
+            | IDCMP_MENUPICK | IDCMP_ACTIVEWINDOW | IDCMP_INACTIVEWINDOW,
         WA_ReportMouse, TRUE,
         TAG_DONE);
 
@@ -408,6 +409,14 @@ int gpa_poll_event(void *handle, GpaEvent *out)
             break;
         case IDCMP_NEWSIZE:
             kind = GPA_EVENT_NEWSIZE;
+            break;
+        case IDCMP_ACTIVEWINDOW:
+            kind = GPA_EVENT_ACTIVATE;
+            code = 1;
+            break;
+        case IDCMP_INACTIVEWINDOW:
+            kind = GPA_EVENT_ACTIVATE;
+            code = 0;
             break;
         case IDCMP_REFRESHWINDOW:
             /* Intuition requires the Begin/EndRefresh pair even though we
@@ -842,6 +851,14 @@ typedef struct GpaMenuSpec {
     int disabled;
     int checked;
 } GpaMenuSpec;
+
+/* PlatformWindow::activate: make this the active Intuition window. */
+void gpa_activate_window(void *handle)
+{
+    GpaWindow *w = handle;
+    if (w && w->win)
+        ActivateWindow(w->win);
+}
 
 int gpa_set_menus(void *handle, const GpaMenuSpec *specs, int count)
 {

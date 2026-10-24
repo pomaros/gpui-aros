@@ -109,14 +109,21 @@ impl MenuState {
     fn push_items(&mut self, items: Vec<MenuItem>, level: i32, keymap: &Keymap) {
         for item in items {
             match item {
-                MenuItem::Separator => self.spec.push(FlatMenuItem {
-                    level,
-                    id: -1,
-                    label: CString::default(),
-                    commkey: None,
-                    disabled: false,
-                    checked: false,
-                }),
+                MenuItem::Separator => {
+                    // gpui menus carry separators around platform-only items;
+                    // on AROS those items are absent, so two bars would meet.
+                    let doubled = matches!(self.spec.last(), Some(last) if last.id == -1 && last.level == level);
+                    if !doubled {
+                        self.spec.push(FlatMenuItem {
+                            level,
+                            id: -1,
+                            label: CString::default(),
+                            commkey: None,
+                            disabled: false,
+                            checked: false,
+                        });
+                    }
+                }
                 MenuItem::Action {
                     name,
                     action,

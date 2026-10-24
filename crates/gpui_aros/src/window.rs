@@ -1,6 +1,6 @@
 //! An AROS Intuition window, wrapping the C glue handle.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::CString;
 use std::os::raw::{c_int, c_void};
 use std::rc::Rc;
@@ -76,6 +76,11 @@ pub(crate) struct ArosWindowInner {
     /// Shared with the platform: the flattened menu spec + action registry
     /// + gpui's app-menu-action callback (see `menus.rs`).
     menu_state: Rc<RefCell<MenuState>>,
+    /// This window's gpui handle, and the platform's notion of the active
+    /// window (shared cell): Intuition's ACTIVEWINDOW/INACTIVEWINDOW keep it
+    /// true, and a closing window never stays the active one.
+    handle: AnyWindowHandle,
+    active_window: Rc<Cell<Option<AnyWindowHandle>>>,
 }
 
 impl Drop for ArosWindowInner {
@@ -100,6 +105,7 @@ impl ArosWindow {
         params: WindowParams,
         display: Rc<dyn PlatformDisplay>,
         menu_state: Rc<RefCell<MenuState>>,
+        active_window: Rc<Cell<Option<AnyWindowHandle>>>,
     ) -> anyhow::Result<Self> {
         let bounds = params.bounds;
         let width = f32::from(bounds.size.width).max(1.0) as i32;
@@ -150,6 +156,8 @@ impl ArosWindow {
             display,
             atlas,
             menu_state,
+            handle,
+            active_window,
         });
 
         // Menus set before this window existed apply to it too (the strip
@@ -210,6 +218,7 @@ impl ArosWindowInner {
         match event.kind {
             glue::GPA_EVENT_CLOSE => self.handle_close(),
             glue::GPA_EVENT_NEWSIZE => self.handle_resize(),
+            glue::GPA_EVENT_ACTIVATE => self.handle_activate(event.code != 0),
             glue::GPA_EVENT_REFRESH => {
                 // Externally damaged (exposed) — the diff won't see it, so
                 // force a full repaint + re-blit.
@@ -584,6 +593,21 @@ impl ArosWindowInner {
         }
     }
 
+    /// Intuition activated or deactivated this window.
+    fn handle_activate(&self, active: bool) {
+        self.state.borrow_mut().is_active = active;
+        if active {
+            self.active_window.set(Some(self.handle));
+        } else if self.active_window.get() == Some(self.handle) {
+            self.active_window.set(None);
+        }
+        let taken = self.callbacks.borrow_mut().active_status_change.take();
+        if let Some(mut f) = taken {
+            f(active);
+            self.callbacks.borrow_mut().active_status_change = Some(f);
+        }
+    }
+
     fn handle_close(&self) {
         // Ask GPUI whether to close (default: yes).
         let should_close = {
@@ -600,6 +624,9 @@ impl ArosWindowInner {
             return;
         }
         self.state.borrow_mut().closed = true;
+        if self.active_window.get() == Some(self.handle) {
+            self.active_window.set(None);
+        }
         let close = self.callbacks.borrow_mut().close.take();
         if let Some(f) = close {
             f();
@@ -707,7 +734,13 @@ impl PlatformWindow for ArosWindow {
     }
 
     fn activate(&self) {
+        let handle = self.inner.state.borrow().handle;
+        if !handle.is_null() {
+            // SAFETY: valid handle; Intuition answers with ACTIVEWINDOW.
+            unsafe { glue::gpa_activate_window(handle) };
+        }
         self.inner.state.borrow_mut().is_active = true;
+        self.inner.active_window.set(Some(self.inner.handle));
     }
 
     fn is_active(&self) -> bool {

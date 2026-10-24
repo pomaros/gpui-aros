@@ -47,7 +47,8 @@ pub struct ArosPlatform {
     text_system: Arc<dyn PlatformTextSystem>,
     display: Rc<dyn PlatformDisplay>,
     windows: RefCell<Vec<Weak<ArosWindowInner>>>,
-    active_window: RefCell<Option<AnyWindowHandle>>,
+    /// Shared with every window: Intuition activation events keep it true.
+    active_window: Rc<Cell<Option<AnyWindowHandle>>>,
     callbacks: RefCell<PlatformCallbacks>,
     menu_state: Rc<RefCell<MenuState>>,
     quit_requested: Cell<bool>,
@@ -76,7 +77,7 @@ impl ArosPlatform {
             text_system,
             display,
             windows: RefCell::new(Vec::new()),
-            active_window: RefCell::new(None),
+            active_window: Rc::new(Cell::new(None)),
             callbacks: RefCell::new(PlatformCallbacks::default()),
             menu_state: Rc::new(RefCell::new(MenuState::default())),
             quit_requested: Cell::new(false),
@@ -276,7 +277,7 @@ impl Platform for ArosPlatform {
     }
 
     fn active_window(&self) -> Option<AnyWindowHandle> {
-        *self.active_window.borrow()
+        self.active_window.get()
     }
 
     fn open_window(
@@ -285,9 +286,9 @@ impl Platform for ArosPlatform {
         options: WindowParams,
     ) -> Result<Box<dyn PlatformWindow>> {
         let window =
-            ArosWindow::open(handle, options, self.display.clone(), self.menu_state.clone())?;
+            ArosWindow::open(handle, options, self.display.clone(), self.menu_state.clone(), self.active_window.clone())?;
         self.windows.borrow_mut().push(Rc::downgrade(&window.inner()));
-        *self.active_window.borrow_mut() = Some(handle);
+        self.active_window.set(Some(handle));
         Ok(Box::new(window))
     }
 

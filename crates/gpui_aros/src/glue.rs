@@ -34,6 +34,8 @@ pub(crate) const GPA_EVENT_RAWKEY: c_int = 7;
 /// `code` = the item id passed to `gpa_set_menus` (an index into the
 /// platform's action registry).
 pub(crate) const GPA_EVENT_MENUPICK: c_int = 8;
+/// code = 1 when Intuition activated the window, 0 when it deactivated it.
+pub(crate) const GPA_EVENT_ACTIVATE: c_int = 9;
 
 /// Mouse-button codes carried in `GpaEvent::code` for mousedown/up.
 pub(crate) const GPA_BUTTON_LEFT: c_int = 0;
@@ -62,6 +64,7 @@ unsafe extern "C" {
     );
 
     pub(crate) fn gpa_poll_event(handle: *mut c_void, out: *mut GpaEvent) -> c_int;
+    pub(crate) fn gpa_activate_window(handle: *mut c_void);
 
     pub(crate) fn gpa_window_sigmask(handle: *mut c_void) -> c_uint;
 
