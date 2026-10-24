@@ -81,6 +81,9 @@ unsafe extern "C" {
     /// Record the main task + allocate the wake signal. Main thread, once,
     /// before the run loop.
     pub(crate) fn gpa_init_main();
+    /// Give back the wake signal and the run loop's timer. Main thread, once,
+    /// after the run loop.
+    pub(crate) fn gpa_shutdown_main();
     /// Sampling profiler of the main task (see the glue): start at
     /// `interval_us`, stop and write the samples to `path`.
     pub(crate) fn gpa_profile_start(interval_us: std::os::raw::c_ulong) -> c_int;

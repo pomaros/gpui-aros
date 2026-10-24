@@ -191,6 +191,52 @@ void gpa_init_main(void)
     }
 }
 
+/* Tasks inside gpa_wake_main() right now: shutdown waits for them before it
+ * frees the bit, since one may already have read it. */
+static LONG gpa_wake_users;
+
+/* Called once from the main thread when the run loop has ended: gives back
+ * the wake signal and the timer's port, which belong to the main task (dos
+ * otherwise reports them as unfreed signals at exit). The dispatcher's
+ * workers may still run (its Drop closes the queues but does not join them),
+ * so the bit is retired first and then every gpa_wake_main() already past
+ * its read of the bit is waited for, a millisecond at a time on our own
+ * timer: a worker that starts later reads -1 and signals nothing, and none
+ * signals a bit after it is freed. Both sides use sequentially consistent
+ * atomics, so the retiring store and a worker's count are seen in one
+ * order. The timer request is never in flight here: gpa_wait_timeout_ms
+ * always waits for it before returning. */
+void gpa_shutdown_main(void)
+{
+    LONG sigbit = gpa_wake_sigbit;
+
+    __atomic_store_n(&gpa_wake_sigbit, -1, __ATOMIC_SEQ_CST);
+    while (__atomic_load_n(&gpa_wake_users, __ATOMIC_SEQ_CST) != 0) {
+        if (!gpa_timer_req) {
+            /* No timer to wait on, and spinning would starve a worker of
+             * lower priority: keep the bit allocated rather than free it
+             * under a Signal. */
+            sigbit = -1;
+            break;
+        }
+        gpa_timer_req->tr_node.io_Command = TR_ADDREQUEST;
+        gpa_timer_req->tr_time.tv_secs = 0;
+        gpa_timer_req->tr_time.tv_micro = 1000;
+        DoIO((struct IORequest *)gpa_timer_req);
+    }
+    if (gpa_timer_req) {
+        CloseDevice((struct IORequest *)gpa_timer_req);
+        DeleteIORequest((struct IORequest *)gpa_timer_req);
+        gpa_timer_req = NULL;
+    }
+    if (gpa_timer_port) {
+        DeleteMsgPort(gpa_timer_port);
+        gpa_timer_port = NULL;
+    }
+    if (sigbit >= 0)
+        FreeSignal(sigbit);
+}
+
 unsigned gpa_wake_sigmask(void)
 {
     return gpa_wake_sigbit >= 0 ? (1u << gpa_wake_sigbit) : 0;
@@ -222,8 +268,13 @@ unsigned long gpa_task_ptr(void)
 /* Callable from any task/thread; no-op before gpa_init_main. */
 void gpa_wake_main(void)
 {
-    if (gpa_main_task && gpa_wake_sigbit >= 0)
-        Signal(gpa_main_task, 1u << gpa_wake_sigbit);
+    LONG sigbit;
+
+    __atomic_add_fetch(&gpa_wake_users, 1, __ATOMIC_SEQ_CST);
+    sigbit = __atomic_load_n(&gpa_wake_sigbit, __ATOMIC_SEQ_CST);
+    if (gpa_main_task && sigbit >= 0)
+        Signal(gpa_main_task, 1u << sigbit);
+    __atomic_sub_fetch(&gpa_wake_users, 1, __ATOMIC_SEQ_CST);
 }
 
 static char *gpa_strdup(const char *s)

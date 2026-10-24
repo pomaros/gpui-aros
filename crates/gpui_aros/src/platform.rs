@@ -203,6 +203,9 @@ impl Platform for ArosPlatform {
             let n = unsafe { crate::glue::gpa_profile_stop(path.as_ptr()) };
             log::info!("gpui_aros profile: {n} samples written");
         }
+        // The run loop is over: its wake signal and timer go back to Exec.
+        // SAFETY: FFI; main thread, after the last wait of the run loop.
+        unsafe { crate::glue::gpa_shutdown_main() };
     }
 
     fn quit(&self) {
