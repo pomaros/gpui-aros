@@ -35,6 +35,7 @@ version. The Zed application itself will consume the backend through a
 | `gpa_profile_*` in the glue | sampling profiler of the main task: `GPUI_AROS_PROFILE=<file>` samples its program counter every millisecond from its exec register frame and writes the samples at exit; `Ferail/scripts/aros-profile-symbolize.py` names them against the unstripped binary |
 | `src/atlas.rs` | `CpuAtlas`: etagere shelf packing over `Vec<u8>` textures |
 | `src/dispatcher.rs` | std-thread background pool and the main-thread queue |
+| `src/requesters.rs` | owned native requester threads, shutdown joins and byte-preserving DOS paths |
 | `src/display.rs` | one display from `gpa_screen_size` |
 | `src/input.rs` | RAWKEY to `Keystroke`, qualifiers to `Modifiers`, mouse |
 | `src/menus.rs` | GPUI menus to GadTools `NewMenu` strips, picks to actions |
@@ -72,7 +73,7 @@ host: `cargo test -p gpui_aros` runs the conformance suite described in
   Intuition's menu strip owns the button.
 - **Menus, requesters, pointers, clipboard.** `set_menus` builds a GadTools
   strip; `prompt_for_paths` and `prompt_for_new_path` open an ASL requester
-  (synchronously, on the UI task); `set_cursor_style` installs an Intuition
+  on dedicated, owned requester threads; `set_cursor_style` installs an Intuition
   pointer object; clipboard text is IFF FTXT in ISO-8859-1 on unit 0. Window
   titles are folded to Latin-1 for the Intuition title font.
 - **Unavailable on AROS, reported as such.** `prevent_idle_sleep` returns an
@@ -101,6 +102,11 @@ minimal consumer: one window, every renderer primitive, keyboard echo.
 
 - Pattern fills (slash, checkerboard), per-edge border widths other than the
   tree connectors, sprite rotation and `Surfaces` (video) are not drawn.
-- The ASL requester blocks the UI task while open.
+- ASL requesters keep painting and input running. Application shutdown waits
+  for open requesters to complete or be cancelled, then joins their threads
+  before unloading native code. Each request owns its `asl.library` reference.
+  DOS paths retain their original bytes, including UTF-8 and legacy names;
+  only display titles use the UI charset. Embedded NUL and truncated results
+  are reported as errors.
 - The dispatcher's worker count and priorities were tuned on a hosted,
   single-CPU AROS; native SMP qualification is open.

@@ -44,7 +44,6 @@ struct Library *KeymapBase;
  * lazily opened and non-fatal when missing: without gadtools there are no
  * pulldowns, without asl the path prompts return "cancelled". */
 struct Library *GadToolsBase;
-struct Library *AslBase;
 /* DOSBase comes from the C startup the final binary always links. */
 
 /* Queued MENUPICK actions: an Intuition menu drag can select several items
@@ -107,10 +106,7 @@ static int gpa_init(void)
     if (!GadToolsBase) {
         GadToolsBase = OpenLibrary("gadtools.library", 0);
     }
-    if (!AslBase) {
-        AslBase = OpenLibrary("asl.library", 0);
-    }
-    /* KeymapBase/GadToolsBase/AslBase deliberately not required (see their
+    /* KeymapBase/GadToolsBase deliberately not required (see their
      * comments). */
     return (IntuitionBase && CyberGfxBase) ? 0 : -1;
 }
@@ -544,6 +540,16 @@ unsigned gpa_window_sigmask(void *handle)
  * in gpa_init_main) for the timeout instead of 500 disposable ones a second.
  *
  * Main-task only (the timer port's signal bit belongs to that task). */
+/* Shutdown uses only the existing owner signal. No deadline timer is needed;
+ * every joined worker publishes completion before signalling this task. */
+int gpa_wait_dispatcher_shutdown(void)
+{
+    if (FindTask(NULL) != gpa_main_task || gpa_wake_sigbit < 0)
+        return -1;
+    Wait(1ul << gpa_wake_sigbit);
+    return 0;
+}
+
 void gpa_wait_timeout_ms(unsigned mask, int ms)
 {
     ULONG timer_sig;
@@ -1034,10 +1040,10 @@ void gpa_set_pointer(void *handle, int style)
 
 /* ---- File requesters (asl.library) -------------------------------------
  *
- * Blocking, main-thread: AslRequest runs the requester's inner event loop
- * in the calling task; our window simply doesn't repaint while the (modal)
- * requester is up. Returns 0 and an AllocVec'd, NUL-separated,
- * double-NUL-terminated path list on OK; -1 on cancel/failure. */
+ * Called on an owned requester worker. Its library reference and request
+ * storage live until the blocking inner loop returns; the GPUI thread keeps
+ * processing its own window events. Returns 0 with an AllocVec'd path list,
+ * 1 on cancellation, and -1 on failure. */
 
 int gpa_asl_request_paths(int save_mode, int drawers_only, int multiselect,
                           const char *initial_drawer,
@@ -1046,7 +1052,8 @@ int gpa_asl_request_paths(int save_mode, int drawers_only, int multiselect,
 {
     *out = NULL;
     *out_len = 0;
-    if (gpa_init() != 0 || !AslBase)
+    struct Library *AslBase = OpenLibrary("asl.library", 0);
+    if (!AslBase)
         return -1;
 
     struct FileRequester *fr = AllocAslRequestTags(ASL_FileRequest,
@@ -1057,11 +1064,14 @@ int gpa_asl_request_paths(int save_mode, int drawers_only, int multiselect,
         ASLFR_DrawersOnly, drawers_only ? TRUE : FALSE,
         ASLFR_DoMultiSelect, (multiselect && !drawers_only) ? TRUE : FALSE,
         TAG_DONE);
-    if (!fr)
+    if (!fr) {
+        CloseLibrary(AslBase);
         return -1;
+    }
 
-    int rc = -1;
+    int rc = 1;
     if (AslRequestTags(fr, TAG_DONE)) {
+        rc = -1;
         /* Assemble "drawer/file" paths with AddPart into one buffer. */
         ULONG cap = 4096;
         UBYTE *buf = AllocVec(cap, MEMF_ANY);
@@ -1077,12 +1087,20 @@ int gpa_asl_request_paths(int save_mode, int drawers_only, int multiselect,
                 : (const char *)fr->fr_File;
             path[0] = 0;
             if (fr->fr_Drawer) {
+                if (strlen((const char *)fr->fr_Drawer) >= sizeof(path)) {
+                    FreeVec(buf);
+                    buf = NULL;
+                    break;
+                }
                 strncpy(path, (const char *)fr->fr_Drawer, sizeof(path) - 1);
                 path[sizeof(path) - 1] = 0;
             }
             if (!drawers_only && leaf && leaf[0]) {
-                if (!AddPart((STRPTR)path, (CONST_STRPTR)leaf, sizeof(path)))
-                    continue;
+                if (!AddPart((STRPTR)path, (CONST_STRPTR)leaf, sizeof(path))) {
+                    FreeVec(buf);
+                    buf = NULL;
+                    break;
+                }
             }
             ULONG plen = strlen(path) + 1;
             if (used + plen + 1 > cap) {
@@ -1111,6 +1129,7 @@ int gpa_asl_request_paths(int save_mode, int drawers_only, int multiselect,
         }
     }
     FreeAslRequest(fr);
+    CloseLibrary(AslBase);
     return rc;
 }
 

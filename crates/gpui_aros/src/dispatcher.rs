@@ -6,11 +6,16 @@
 //! servicing all `dispatch_after` deadlines from a min-heap.
 
 use std::cmp::Ordering;
-use std::ffi::c_int;
 use std::collections::{BinaryHeap, VecDeque};
+use std::ffi::c_int;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::thread::{self, ThreadId};
+
+#[path = "worker_threads.rs"]
+mod worker_threads;
 use std::time::{Duration, Instant};
+use worker_threads::WorkerThreads;
 
 use gpui::{PlatformDispatcher, Priority, RunnableVariant};
 use parking_lot::Mutex;
@@ -34,6 +39,12 @@ use crate::glue;
 /// pinned at 100% in `crossbeam_channel::flavors::list::Channel::recv` while
 /// the UI sat in READY. A mutex+condvar blocks immediately and hands the CPU
 /// back.
+enum QueueWait<T> {
+    Item(T),
+    TimedOut,
+    Closed,
+}
+
 struct BlockingQueue<T> {
     items: StdMutex<Option<VecDeque<T>>>, // None => closed
     ready: StdCondvar,
@@ -69,10 +80,7 @@ impl<T> BlockingQueue<T> {
                 Some(q) => match q.pop_front() {
                     Some(item) => return Some(item),
                     None => {
-                        guard = self
-                            .ready
-                            .wait(guard)
-                            .unwrap_or_else(|e| e.into_inner());
+                        guard = self.ready.wait(guard).unwrap_or_else(|e| e.into_inner());
                     }
                 },
                 None => return None,
@@ -80,23 +88,46 @@ impl<T> BlockingQueue<T> {
         }
     }
 
-    /// Block until an item arrives or `timeout` elapses.
-    fn pop_timeout(&self, timeout: Duration) -> Option<T> {
-        let mut guard = self.items.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(item) = guard.as_mut()?.pop_front() {
-            return Some(item);
+    /// Closed and timeout are distinct: a pending timer heap must never
+    /// turn a closed queue into a spin until its far-future deadline.
+    fn pop_timeout(&self, timeout: Duration) -> QueueWait<T> {
+        let mut guard = self.items.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(items) = guard.as_mut() else {
+            return QueueWait::Closed;
+        };
+        if let Some(item) = items.pop_front() {
+            return QueueWait::Item(item);
         }
         guard = self
             .ready
             .wait_timeout(guard, timeout)
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|error| error.into_inner())
             .0;
-        guard.as_mut()?.pop_front()
+        match guard.as_mut() {
+            None => QueueWait::Closed,
+            Some(items) => match items.pop_front() {
+                Some(item) => QueueWait::Item(item),
+                None => QueueWait::TimedOut,
+            },
+        }
     }
 
     fn close(&self) {
-        *self.items.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let discarded = self
+            .items
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
         self.ready.notify_all();
+        // Runnable destruction may reenter dispatch. Never drop under lock.
+        drop(discarded);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.items
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_none()
     }
 }
 
@@ -154,14 +185,13 @@ pub(crate) struct ArosDispatcher {
     main_queue: Arc<Mutex<VecDeque<RunnableVariant>>>,
     background_queue: Arc<BlockingQueue<RunnableVariant>>,
     timer_queue: Arc<BlockingQueue<(Instant, RunnableVariant)>>,
-    _background_threads: Vec<thread::JoinHandle<()>>,
-    _timer_thread: thread::JoinHandle<()>,
+    workers: WorkerThreads,
+    foreground_closed: AtomicBool,
 }
 
 impl Drop for ArosDispatcher {
     fn drop(&mut self) {
-        self.background_queue.close();
-        self.timer_queue.close();
+        self.shutdown();
     }
 }
 
@@ -172,8 +202,7 @@ impl ArosDispatcher {
         // plain blocking MPMC queue backs the worker pool. Priority is not
         // honored; the run loop's frame cadence keeps latency bounded
         // (correctness first).
-        let background_queue: Arc<BlockingQueue<RunnableVariant>> =
-            Arc::new(BlockingQueue::new());
+        let background_queue: Arc<BlockingQueue<RunnableVariant>> = Arc::new(BlockingQueue::new());
         // Every AROS task -- including these workers -- is multiplexed onto a
         // SINGLE host thread by the hosted kernel, so `available_parallelism()`
         // (the host's core count, ~10-14 on an Apple Silicon Mac) buys exactly
@@ -188,24 +217,25 @@ impl ArosDispatcher {
             thread::available_parallelism().map_or(MIN_THREADS, |n| n.get().max(MIN_THREADS))
         };
 
-        let background_threads = (0..thread_count)
-            .map(|i| {
-                let queue = background_queue.clone();
-                thread::Builder::new()
-                    .name(format!("gpui-aros-worker-{i}"))
-                    .spawn(move || {
-                        // Same priority as the UI task (see WORKER_PRI doc):
-                        // exec round-robins equal-pri tasks per quantum now
-                        // that preemption ticks actually arrive.
-                        // SAFETY: FFI; acts on the calling task only.
-                        unsafe { glue::gpa_lower_task_pri(WORKER_PRI) };
-                        while let Some(runnable) = queue.pop() {
-                            runnable.run();
-                        }
-                    })
-                    .expect("failed to spawn gpui_aros background worker")
-            })
-            .collect::<Vec<_>>();
+        let workers = WorkerThreads::new(|| {
+            // Completion wakes the owner even if no foreground work remains.
+            unsafe { glue::gpa_wake_main() };
+        });
+        for i in 0..thread_count {
+            let queue = background_queue.clone();
+            workers
+                .spawn(format!("gpui-aros-worker-{i}"), move || {
+                    // Same priority as the UI task (see WORKER_PRI doc):
+                    // exec round-robins equal-pri tasks per quantum now
+                    // that preemption ticks actually arrive.
+                    // SAFETY: FFI; acts on the calling task only.
+                    unsafe { glue::gpa_lower_task_pri(WORKER_PRI) };
+                    while let Some(runnable) = queue.pop() {
+                        runnable.run();
+                    }
+                })
+                .expect("failed to spawn gpui_aros background worker")
+        }
 
         let main_queue = Arc::new(Mutex::new(VecDeque::new()));
 
@@ -217,12 +247,11 @@ impl ArosDispatcher {
         // path (fatal in AROS's single address space).
         let timer_queue: Arc<BlockingQueue<(Instant, RunnableVariant)>> =
             Arc::new(BlockingQueue::new());
-        let timer_thread = {
+        {
             let main_queue = main_queue.clone();
             let timer_queue = timer_queue.clone();
-            thread::Builder::new()
-                .name("gpui-aros-timer".to_owned())
-                .spawn(move || {
+            workers
+                .spawn("gpui-aros-timer".to_owned(), move || {
                     // Same rationale as the workers (see WORKER_PRI doc).
                     // SAFETY: FFI; acts on the calling task only.
                     unsafe { glue::gpa_lower_task_pri(WORKER_PRI) };
@@ -236,9 +265,51 @@ impl ArosDispatcher {
             main_queue,
             background_queue,
             timer_queue,
-            _background_threads: background_threads,
-            _timer_thread: timer_thread,
+            workers,
+            foreground_closed: AtomicBool::new(false),
         }
+    }
+
+    /// Called after quit observers, while foreground callbacks can still
+    /// run on the owner. Never wait for a live worker that needs that owner.
+    pub(crate) fn shutdown(&self) {
+        if !self.workers.is_owner() && !self.workers.is_empty() {
+            log::error!("gpui_aros: active dispatcher shutdown outside owner thread");
+            std::process::abort();
+        }
+        self.workers.close().unwrap_or_else(|error| {
+            log::error!("gpui_aros: cannot start owned shutdown joiner: {error}");
+            std::process::abort();
+        });
+        self.background_queue.close();
+        self.timer_queue.close();
+        loop {
+            while let Some(runnable) = { self.main_queue.lock().pop_front() } {
+                runnable.run();
+            }
+            let (remaining, panics) = self.workers.join_completed().unwrap_or_else(|error| {
+                log::error!("gpui_aros: unsafe dispatcher shutdown: {error}");
+                std::process::abort();
+            });
+            if panics != 0 {
+                log::error!("gpui_aros: {panics} dispatcher workers panicked");
+            }
+            if remaining == 0 {
+                break;
+            }
+            // Existing native wake signal, no polling/Delay/timer deadline.
+            // The owned joiner or a foreground dispatch wakes us.
+            if unsafe { glue::gpa_wait_dispatcher_shutdown() } != 0 {
+                log::error!("gpui_aros: shutdown has no valid owner wake signal");
+                std::process::abort();
+            }
+        }
+        let discarded = {
+            let mut queue = self.main_queue.lock();
+            self.foreground_closed.store(true, AtomicOrdering::Release);
+            std::mem::take(&mut *queue)
+        };
+        drop(discarded);
     }
 
     /// Shared handle to the main-thread queue, drained by the run loop.
@@ -259,7 +330,14 @@ impl PlatformDispatcher for ArosDispatcher {
     }
 
     fn dispatch_on_main_thread(&self, runnable: RunnableVariant, _priority: Priority) {
-        self.main_queue.lock().push_back(runnable);
+        let mut queue = self.main_queue.lock();
+        if self.foreground_closed.load(AtomicOrdering::Acquire) {
+            drop(queue);
+            log::error!("gpui_aros: foreground dispatch after shutdown");
+            return;
+        }
+        queue.push_back(runnable);
+        drop(queue);
         // Nudge the run loop out of its park so the work starts within the
         // poll granularity (~2 ms) instead of the frame budget. Safe from
         // any thread (hosted-AROS threads are exec tasks); no-op pre-init.
@@ -277,7 +355,9 @@ impl PlatformDispatcher for ArosDispatcher {
     }
 
     fn spawn_realtime(&self, f: Box<dyn FnOnce() + Send>) {
-        thread::spawn(f);
+        if let Err(error) = self.workers.spawn("gpui-aros-realtime".into(), f) {
+            log::error!("gpui_aros: realtime dispatch rejected: {error}");
+        }
     }
 }
 
@@ -292,6 +372,9 @@ fn timer_loop(
     let mut heap: BinaryHeap<TimerEntry> = BinaryHeap::new();
     let mut seq: u64 = 0;
     loop {
+        if queue.is_closed() {
+            return;
+        }
         // Fire everything already due.
         let now = Instant::now();
         let mut woke = false;
@@ -315,9 +398,9 @@ fn timer_loop(
                     continue;
                 }
                 match queue.pop_timeout(timeout) {
-                    Some(item) => Some(item),
-                    // Timed out (or spurious): loop back and fire matured deadlines.
-                    None => continue,
+                    QueueWait::Item(item) => Some(item),
+                    QueueWait::TimedOut => continue,
+                    QueueWait::Closed => return,
                 }
             }
             // Nothing pending: block. `None` means the queue closed (shutdown).
@@ -334,5 +417,45 @@ fn timer_loop(
             });
             seq = seq.wrapping_add(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn closed_timer_queue_does_not_wait_for_far_future_deadline() {
+        let queue = Arc::new(BlockingQueue::<u8>::new());
+        let other = queue.clone();
+        let (started, ready) = mpsc::channel();
+        let (finished, completion) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            started.send(()).unwrap();
+            assert!(matches!(
+                other.pop_timeout(Duration::from_secs(3600)),
+                QueueWait::Closed
+            ));
+            finished.send(()).unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        queue.close();
+        completion.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn discarding_queued_values_can_reenter_without_queue_lock() {
+        struct Reenter(Arc<BlockingQueue<Reenter>>);
+        impl Drop for Reenter {
+            fn drop(&mut self) {
+                assert!(self.0.is_closed());
+            }
+        }
+        let queue = Arc::new(BlockingQueue::new());
+        assert!(queue.push(Reenter(queue.clone())));
+        queue.close();
+        assert!(queue.is_closed());
     }
 }

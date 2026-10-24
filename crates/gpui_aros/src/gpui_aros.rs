@@ -21,6 +21,8 @@ mod atlas;
 mod damage;
 pub mod input;
 mod renderer;
+#[cfg(any(target_os = "aros", test))]
+mod requesters;
 
 #[cfg(test)]
 mod conformance;

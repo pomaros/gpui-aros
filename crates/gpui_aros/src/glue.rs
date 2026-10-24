@@ -66,6 +66,7 @@ unsafe extern "C" {
     pub(crate) fn gpa_window_sigmask(handle: *mut c_void) -> c_uint;
 
     pub(crate) fn gpa_wait_timeout_ms(mask: c_uint, ms: c_int);
+    pub(crate) fn gpa_wait_dispatcher_shutdown() -> c_int;
 
     pub(crate) fn gpa_inner_size(handle: *mut c_void, out_w: *mut c_int, out_h: *mut c_int);
 
@@ -133,7 +134,7 @@ unsafe extern "C" {
 
     /// Blocking asl.library file requester. On success (0) hands out an
     /// AllocVec'd NUL-separated, double-NUL-terminated path list
-    /// (`gpa_free` it). Cancel/failure returns -1.
+    /// (`gpa_free` it). Cancellation returns 1; failure returns -1.
     pub(crate) fn gpa_asl_request_paths(
         save_mode: c_int,
         drawers_only: c_int,

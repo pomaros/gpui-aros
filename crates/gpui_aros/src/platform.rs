@@ -21,6 +21,7 @@ use crate::dispatcher::ArosDispatcher;
 use crate::display::ArosDisplay;
 use crate::menus::{MenuState, to_latin1};
 use crate::text;
+use crate::requesters::{RequestThreads, path_cstring, path_from_bytes};
 use crate::window::{ArosWindow, ArosWindowInner};
 
 // ~30fps: the run loop parks at most this long between frames.
@@ -51,6 +52,7 @@ pub struct ArosPlatform {
     menu_state: Rc<RefCell<MenuState>>,
     quit_requested: Cell<bool>,
     cursor_visible: Cell<bool>,
+    requesters: RefCell<RequestThreads>,
     #[allow(dead_code)]
     headless: bool,
 }
@@ -79,6 +81,7 @@ impl ArosPlatform {
             menu_state: Rc::new(RefCell::new(MenuState::default())),
             quit_requested: Cell::new(false),
             cursor_visible: Cell::new(true),
+            requesters: RefCell::new(RequestThreads::default()),
             headless,
         }
     }
@@ -103,6 +106,41 @@ impl ArosPlatform {
         let mut windows = self.windows.borrow_mut();
         windows.retain(|w| w.strong_count() > 0);
         windows.iter().filter_map(Weak::upgrade).collect()
+    }
+
+    fn can_exit(&self) -> bool {
+        let (idle, panics) = self.requesters.borrow_mut().reap_finished();
+        if panics != 0 {
+            log::error!("gpui_aros: {panics} native requester workers panicked");
+        }
+        self.quit_requested.get() && idle
+    }
+
+    fn request<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> oneshot::Receiver<Result<T>> {
+        let (sender, receiver) = oneshot::channel();
+        let sender = Arc::new(parking_lot::Mutex::new(Some(sender)));
+        let worker_sender = sender.clone();
+        let spawned = self.requesters.borrow_mut().spawn(move || {
+            let result = work();
+            let sender = worker_sender.lock().take();
+            if let Some(sender) = sender {
+                if sender.send(result).is_err() {
+                    log::debug!("gpui_aros: requester caller closed before completion");
+                }
+            }
+        });
+        if let Err(error) = spawned {
+            let sender = sender.lock().take();
+            if let Some(sender) = sender {
+                if sender.send(Err(error.into())).is_err() {
+                    log::debug!("gpui_aros: requester caller closed before spawn failure");
+                }
+            }
+        }
+        receiver
     }
 }
 
@@ -136,7 +174,7 @@ impl Platform for ArosPlatform {
         let mut profile_flushed = Instant::now();
         on_finish_launching();
 
-        while !self.quit_requested.get() {
+        while !self.can_exit() {
             let frame_start = Instant::now();
             if let Some(path) = &profile_path {
                 // The samples so far every thirty seconds: a profile of a
@@ -149,7 +187,7 @@ impl Platform for ArosPlatform {
             }
 
             self.drain_main_thread();
-            if self.quit_requested.get() {
+            if self.can_exit() {
                 break;
             }
 
@@ -160,7 +198,7 @@ impl Platform for ArosPlatform {
             for window in &windows {
                 window.request_frame();
             }
-            if self.quit_requested.get() {
+            if self.can_exit() {
                 break;
             }
 
@@ -198,6 +236,10 @@ impl Platform for ArosPlatform {
         if let Some(mut on_quit) = on_quit {
             on_quit();
         }
+        // Quit callbacks finish while dispatch is still available. Then stop
+        // admission, service remaining foreground completions and join every
+        // dispatcher-owned worker before this native command can return.
+        self.dispatcher.shutdown();
         if let Some(path) = profile_path {
             // SAFETY: FFI; the sampler is ours and the path is a C string.
             let n = unsafe { crate::glue::gpa_profile_stop(path.as_ptr()) };
@@ -209,6 +251,9 @@ impl Platform for ArosPlatform {
     }
 
     fn quit(&self) {
+        // Quit observers can reenter Platform after the event loop exits.
+        // Refuse new native work before waiting for the admitted workers.
+        self.requesters.borrow_mut().close_admission();
         self.quit_requested.set(true);
     }
 
@@ -264,25 +309,21 @@ impl Platform for ArosPlatform {
         &self,
         options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
-        let (tx, rx) = oneshot::channel();
-        // asl.library file requester, blocking on the main thread (the
-        // requester is modal; our windows just skip repaints meanwhile).
         let dirs_only = options.directories && !options.files;
         let title = options
             .prompt
             .as_ref()
             .map(|p| p.to_string())
             .unwrap_or_else(|| "Select".into());
-        let paths = asl_request(AslRequest {
+        let request = AslRequest {
             save_mode: false,
             drawers_only: dirs_only,
             multiselect: options.multiple,
             initial_drawer: None,
             initial_file: None,
-            title: &title,
-        });
-        tx.send(Ok(paths)).ok();
-        rx
+            title,
+        };
+        self.request(move || asl_request(request))
     }
 
     fn prompt_for_new_path(
@@ -290,17 +331,15 @@ impl Platform for ArosPlatform {
         directory: &Path,
         suggested_name: Option<&str>,
     ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
-        let (tx, rx) = oneshot::channel();
-        let paths = asl_request(AslRequest {
+        let request = AslRequest {
             save_mode: true,
             drawers_only: false,
             multiselect: false,
-            initial_drawer: Some(&directory.to_string_lossy()),
-            initial_file: suggested_name,
-            title: "Save As",
-        });
-        tx.send(Ok(paths.and_then(|mut v| v.pop()))).ok();
-        rx
+            initial_drawer: Some(directory.to_path_buf()),
+            initial_file: suggested_name.map(ToOwned::to_owned),
+            title: "Save As".into(),
+        };
+        self.request(move || asl_request(request).map(|paths| paths.and_then(|mut paths| paths.pop())))
     }
 
     fn can_select_mixed_files_and_dirs(&self) -> bool {
@@ -500,35 +539,29 @@ impl PlatformKeyboardLayout for ArosKeyboardLayout {
     }
 }
 
-struct AslRequest<'a> {
+struct AslRequest {
     save_mode: bool,
     drawers_only: bool,
     multiselect: bool,
-    initial_drawer: Option<&'a str>,
-    initial_file: Option<&'a str>,
-    title: &'a str,
+    initial_drawer: Option<PathBuf>,
+    initial_file: Option<String>,
+    title: String,
 }
 
 /// Run the blocking asl.library file requester and decode the glue's
-/// NUL-separated path list (system charset -> UTF-8, latin-1 semantics).
-/// `None` = cancelled or asl unavailable.
-fn asl_request(req: AslRequest) -> Option<Vec<PathBuf>> {
-    fn latin1_cstring(s: &str) -> std::ffi::CString {
-        let mut bytes = to_latin1(s);
-        bytes.retain(|&b| b != 0);
-        std::ffi::CString::new(bytes).unwrap_or_default()
-    }
-
-    let drawer = latin1_cstring(req.initial_drawer.unwrap_or(""));
-    let file = latin1_cstring(req.initial_file.unwrap_or(""));
-    let title = latin1_cstring(req.title);
+/// NUL-separated path list. DOS filenames are bytes, including UTF-8 or
+/// legacy names; only the requester's display title uses the UI charset.
+fn asl_request(req: AslRequest) -> Result<Option<Vec<PathBuf>>> {
+    let drawer = path_cstring(req.initial_drawer.as_deref().unwrap_or(Path::new("")))?;
+    let file = CString::new(req.initial_file.as_deref().unwrap_or("").as_bytes())?;
+    let title = CString::new(to_latin1(&req.title))?;
 
     let mut buf: *mut std::ffi::c_void = std::ptr::null_mut();
     let mut len: std::os::raw::c_int = 0;
     // SAFETY: FFI; on success `buf` is an AllocVec'd NUL-separated,
     // double-NUL-terminated list we must hand back to gpa_free.
     unsafe {
-        if crate::glue::gpa_asl_request_paths(
+        let result = crate::glue::gpa_asl_request_paths(
             req.save_mode as _,
             req.drawers_only as _,
             req.multiselect as _,
@@ -537,22 +570,23 @@ fn asl_request(req: AslRequest) -> Option<Vec<PathBuf>> {
             title.as_ptr(),
             &mut buf,
             &mut len,
-        ) != 0
-            || buf.is_null()
-        {
-            return None;
+        );
+        if result == 1 {
+            return Ok(None);
+        }
+        if result != 0 || buf.is_null() || len < 2 {
+            if !buf.is_null() {
+                crate::glue::gpa_free(buf);
+            }
+            anyhow::bail!("AROS file requester failed");
         }
         let bytes = std::slice::from_raw_parts(buf as *const u8, len.max(0) as usize);
         let paths: Vec<PathBuf> = bytes
             .split(|&b| b == 0)
             .filter(|part| !part.is_empty())
-            .map(|part| {
-                // System charset is ISO-8859-1: bytes map 1:1 onto the
-                // first 256 Unicode scalars.
-                PathBuf::from(part.iter().map(|&b| b as char).collect::<String>())
-            })
+            .map(path_from_bytes)
             .collect();
         crate::glue::gpa_free(buf);
-        (!paths.is_empty()).then_some(paths)
+        Ok((!paths.is_empty()).then_some(paths))
     }
 }
