@@ -41,4 +41,5 @@ carries the same backend files through its own platform layer.
 
 ## License
 
-Apache-2.0, like GPUI; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache-2.0, like GPUI; see [LICENSE](LICENSE) and [NOTICE](NOTICE). The
+bundled fonts are under the SIL Open Font License 1.1.

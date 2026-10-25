@@ -5,3 +5,8 @@ crates/gpui_platform_aros is derived from Zed's gpui_platform crate as
 published on crates.io as gpui-pre-platform 0.3.8 (zed@279fe07),
 Copyright 2022 - 2025 Zed Industries, Inc., licensed under the Apache License,
 Version 2.0. The AROS arm and the backend dependency are the changes.
+
+crates/gpui_aros/assets/fonts carries IBM Plex Sans (Copyright 2017 IBM
+Corp., Reserved Font Name "Plex") and Lilex (Copyright 2019 The Lilex Project
+Authors), both under the SIL Open Font License 1.1; each directory holds its
+license text. They are the fonts Zed bundles.
