@@ -1,0 +1,13 @@
+# The AROS platform backend for GPUI, on the `gpui-pre` crates.io snapshots.
+#
+# gpui_aros is the backend; gpui_platform_aros is the `gpui-pre-platform`
+# package with an AROS arm that selects it, swapped in by a consumer's
+# `[patch.crates-io]`; gpui_aros_smoke is the smallest AROS consumer. The same
+# patch below lets this workspace build the smoke against the fork.
+
+[workspace]
+resolver = "2"
+members = ["crates/gpui_aros", "crates/gpui_platform_aros", "crates/gpui_aros_smoke"]
+
+[patch.crates-io]
+gpui-pre-platform = { path = "crates/gpui_platform_aros" }

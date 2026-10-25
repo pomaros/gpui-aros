@@ -1,0 +1,7 @@
+gpui-aros: the AROS platform backend for GPUI.
+Copyright (c) 2026 John Knipper.
+
+crates/gpui_platform_aros is derived from Zed's gpui_platform crate as
+published on crates.io as gpui-pre-platform 0.3.8 (zed@279fe07),
+Copyright 2022 - 2025 Zed Industries, Inc., licensed under the Apache License,
+Version 2.0. The AROS arm and the backend dependency are the changes.

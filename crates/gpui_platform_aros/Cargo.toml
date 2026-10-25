@@ -1,8 +1,7 @@
 # AROS fork of the crates.io package gpui-pre-platform 0.3.8 (Zed gpui_platform
-# at 279fe07): the published manifest plus the AROS backend dependency. Not a
-# member of the Zed workspace (see the root manifest's `exclude`): it resolves
-# GPUI from the `gpui-pre` crates.io snapshots, the identity Ferail builds
-# against, and is swapped in through `[patch.crates-io]`.
+# at 279fe07): the published manifest plus the AROS backend dependency. It
+# resolves GPUI from the `gpui-pre` crates.io snapshots, the identity its
+# consumers build against, and is swapped in through `[patch.crates-io]`.
 
 [package]
 edition = "2024"

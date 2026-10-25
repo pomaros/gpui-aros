@@ -10,19 +10,18 @@ the first.
 
 The crate builds against the `gpui-pre` crates.io snapshots of Zed
 (`gpui-pre`, `gpui-pre-collections`, `gpui-pre-wgpu` for the text system), the
-identity its consumers use, and is therefore **not** a member of the Zed
-workspace. Its sibling `../gpui_platform_aros` is the published
-`gpui-pre-platform` source plus one `target_os = "aros"` arm selecting
-`ArosPlatform`; a consumer swaps it in with
+identity its consumers use. Its sibling `../gpui_platform_aros` is the
+published `gpui-pre-platform` source plus one `target_os = "aros"` arm
+selecting `ArosPlatform`; a consumer swaps it in with
 
 ```toml
 [patch.crates-io]
-gpui-pre-platform = { path = ".../zed-aros/crates/gpui_platform_aros" }
+gpui-pre-platform = { git = "https://github.com/pomaros/gpui-aros", rev = "..." }
 ```
 
-and keeps `gpui`, `gpui_platform` and gpui-component on the same snapshot
-version. The Zed application itself will consume the backend through a
-`gpui-pre` shim over its path crates when its AROS build is restored.
+and keeps `gpui`, `gpui_platform` and gpui-kit on the same snapshot version.
+The Zed application, whose GPUI follows Zed rather than a snapshot, carries
+these files through its own platform adaptation layer.
 
 | File | What |
 |---|---|

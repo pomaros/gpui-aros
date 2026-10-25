@@ -1,12 +1,8 @@
-# The GPUI platform backend for AROS, on the `gpui-pre` crates.io identity.
-#
-# Standalone on purpose (the Zed workspace excludes it): consumers such as
-# Ferail depend on GPUI through the `gpui-pre-*` 0.3.8 snapshots of Zed
-# 279fe07, and a backend built against this workspace's path `gpui` would be a
-# second, incompatible GPUI in their graph. The Zed application itself will
-# consume it through a `gpui-pre` shim over its path crates when its own AROS
-# build is restored. Swapped in by `[patch.crates-io] gpui-pre-platform` ->
-# ../gpui_platform_aros, which depends on this crate.
+# The GPUI platform backend for AROS, on the `gpui-pre` crates.io identity:
+# consumers such as Ferail depend on GPUI through the `gpui-pre-*` 0.3.8
+# snapshots of Zed 279fe07, so the backend builds against the same packages.
+# Swapped in by `[patch.crates-io] gpui-pre-platform` -> ../gpui_platform_aros,
+# which depends on this crate.
 
 [package]
 name = "gpui_aros"
