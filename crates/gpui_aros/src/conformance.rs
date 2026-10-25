@@ -70,7 +70,7 @@ fn insert_mono_tile(atlas: &Arc<CpuAtlas>, name: &str, w: i32, h: i32, coverage:
         },
     };
     atlas
-        .get_or_insert_with(&params.into(), &mut || {
+        .get_or_insert_with(params.into(), &mut || {
             Ok(Some((
                 Size {
                     width: DevicePixels(w),
