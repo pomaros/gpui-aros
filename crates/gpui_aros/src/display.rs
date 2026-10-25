@@ -1,6 +1,8 @@
 //! The single synthetic AROS display.
 
 use anyhow::Result;
+use std::time::Duration;
+
 use gpui::{Bounds, DisplayId, Pixels, PlatformDisplay, Point, Size, px};
 use uuid::Uuid;
 
@@ -42,6 +44,12 @@ impl ArosDisplay {
 impl PlatformDisplay for ArosDisplay {
     fn id(&self) -> DisplayId {
         self.id
+    }
+
+    /// graphics.library describes a mode's timings but the backend does not
+    /// read them yet, so it reports no rate.
+    fn refresh_interval(&self) -> Option<Duration> {
+        None
     }
 
     fn uuid(&self) -> Result<Uuid> {

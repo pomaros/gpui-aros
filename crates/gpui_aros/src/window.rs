@@ -12,7 +12,7 @@ use gpui::{
     KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
-    Scene, ScrollDelta, ScrollWheelEvent, Size, TouchPhase, WindowAppearance,
+    Scene, ScrollDelta, ScrollEvent, ScrollSource, Size, TouchPhase, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams, WindowVisibility, px,
 };
 use raw_window_handle::{
@@ -444,11 +444,12 @@ impl ArosWindowInner {
                 _ => return, // fourth button etc. — not a wheel, not a key
             };
             if !is_up {
-                self.fire_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                self.fire_input(PlatformInput::Scroll(ScrollEvent {
                     position,
                     delta: ScrollDelta::Lines(lines),
                     modifiers,
                     touch_phase: TouchPhase::Moved,
+                    source: ScrollSource::Pointer,
                 }));
             }
             return;
@@ -802,6 +803,10 @@ impl PlatformWindow for ArosWindow {
     fn on_moved(&self, callback: Box<dyn FnMut()>) {
         self.inner.callbacks.borrow_mut().moved = Some(callback);
     }
+
+    /// An Intuition window lives on the screen it was opened on and never
+    /// moves to another one, so there is nothing to report.
+    fn on_display_changed(&self, _callback: Box<dyn FnMut()>) {}
 
     fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>) {
         self.inner.callbacks.borrow_mut().should_close = Some(callback);

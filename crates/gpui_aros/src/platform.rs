@@ -12,7 +12,8 @@ use anyhow::Result;
 use futures::channel::oneshot;
 use gpui::{
     Action, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DummyKeyboardMapper,
-    ForegroundExecutor, Keymap, Menu, MenuItem, PathPromptOptions, Platform, PlatformDisplay,
+    ForegroundExecutor, Keymap, Menu, MenuItem, OperatingSystem, PathPromptOptions, Platform,
+    PlatformDisplay, PlatformInfo, PlatformTarget,
     PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, Task,
     ThermalState, WindowAppearance, WindowParams,
 };
@@ -146,6 +147,15 @@ impl ArosPlatform {
 }
 
 impl Platform for ArosPlatform {
+    /// AROS follows the Linux input conventions (Ctrl-based shortcuts, the
+    /// Linux keymaps), which is what `os` describes.
+    fn platform_info(&self) -> PlatformInfo {
+        PlatformInfo {
+            os: OperatingSystem::Linux,
+            target: PlatformTarget::Native,
+        }
+    }
+
     fn background_executor(&self) -> BackgroundExecutor {
         self.background_executor.clone()
     }
@@ -526,6 +536,10 @@ impl Platform for ArosPlatform {
     fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>) {
         self.callbacks.borrow_mut().keyboard_layout_change = Some(callback);
     }
+
+    /// The backend shows its windows on one screen chosen at start-up, so
+    /// the set of displays it reports does not change.
+    fn on_displays_changed(&self, _callback: Box<dyn FnMut()>) {}
 }
 
 struct ArosKeyboardLayout;
