@@ -59,9 +59,9 @@ host: `cargo test -p gpui_aros` runs the conformance suite described in
   rectangles cut into the geometry; a pixel mask exists only for a rounded,
   stroked, path or scaled primitive that straddles its clip. Tinted glyphs
   are cached per tile and color. Subpixel text is off. There is no GPU
-  path. Measured on the M1 at 1400x900: about 1 ms of raster for a hovered
-  row, 4 to 10 ms for the whole window; GPUI's own layout and paint of a
-  file list costs more than that on the boot core.
+  path. At 1400x900, a hovered row costs about 1 ms of raster and the whole
+  window 4 to 10 ms; GPUI's own layout and paint of a file list costs more
+  than that.
 - **Run loop.** One frame per 33 ms at most: drain the main-thread queue,
   poll every window's IDCMP port, request frames, then `Wait()` on the union
   of the window signal masks and the dispatcher's wake signal. When the

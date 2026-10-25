@@ -234,7 +234,7 @@ impl ArosDispatcher {
         let background_queue: Arc<BlockingQueue<RunnableVariant>> = Arc::new(BlockingQueue::new());
         // Every AROS task -- including these workers -- is multiplexed onto a
         // SINGLE host thread by the hosted kernel, so `available_parallelism()`
-        // (the host's core count, ~10-14 on an Apple Silicon Mac) buys exactly
+        // (the host's core count) buys exactly
         // zero parallelism here. It only multiplies context switches (each one
         // a raise()/sigsuspend() signal round-trip) and contention on the
         // shared, not-always-thread-safe C runtime (posixc's fd table, the
