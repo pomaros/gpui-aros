@@ -30,7 +30,7 @@ fn main() {
             println!("GPUI native GPU: adapter={} driver={}", specs.device_name, specs.driver_name);
             cx.spawn(async move |cx| {
                 cx.background_executor().timer(Duration::from_secs(8)).await;
-                cx.update(|cx| cx.quit()).unwrap();
+                cx.update(|cx| cx.quit());
             }).detach();
         });
     println!("GPUI native GPU: event loop exited");
