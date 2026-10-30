@@ -21,7 +21,7 @@ package:
 
 ```toml
 [patch.crates-io]
-raw-window-handle = { git = "https://github.com/pomaros/raw-window-handle", rev = "39372f3" }
+raw-window-handle = { git = "https://github.com/pomaros/raw-window-handle", rev = "39372f35bbd84db1c1e8941a2e73f798ad2c0be2" }
 gpui-pre-platform = { git = "https://github.com/pomaros/gpui-aros", rev = "..." }
 ```
 
@@ -34,6 +34,20 @@ cargo test -p gpui_aros
 ```
 
 runs the renderer and input conformance suite.
+
+## Native GPU renderer
+
+The `native-gpu` feature on `gpui_aros` selects WGPU/GLES presentation through
+native Intuition handles and EGL. Consumers of `gpui-pre-platform` forward it
+with `aros-native-gpu`. Without this feature, the CPU renderer remains selected.
+Set `AROS_EGL_LIB_DIR` to the graphics SDK directory containing `libEGL.a`;
+the build exposes only that entry archive, preserving the managed SDK's CRT.
+Consumers must apply the WGPU and raw-window-handle patches from this workspace.
+
+`main` targets the gpui-pre 0.3.8 API and WGPU 29. `zed-main` targets Zed's
+in-tree GPUI and WGPU 30. Select the branch explicitly when copying or pinning
+the backend. GPU application acceptance requires native rendering, resize and
+shutdown evidence; host conformance tests alone do not establish it.
 
 ## Status
 

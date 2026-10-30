@@ -10,5 +10,6 @@ resolver = "2"
 members = ["crates/gpui_aros", "crates/gpui_platform_aros", "crates/gpui_aros_smoke"]
 
 [patch.crates-io]
-raw-window-handle = { git = "https://github.com/pomaros/raw-window-handle", rev = "39372f3" }
+wgpu = { git = "https://github.com/pomaros/wgpu", rev = "fcc3108b364eb151286b8efc09379d011d867b99" }
+raw-window-handle = { git = "https://github.com/pomaros/raw-window-handle", rev = "39372f35bbd84db1c1e8941a2e73f798ad2c0be2" }
 gpui-pre-platform = { path = "crates/gpui_platform_aros" }
