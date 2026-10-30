@@ -11,6 +11,10 @@ edition = "2024"
 publish = false
 license = "Apache-2.0"
 
+[features]
+# Enable only after selecting an AROS-capable WGPU provider in the consumer.
+native-gpu = []
+
 [lib]
 path = "src/gpui_aros.rs"
 
