@@ -21,6 +21,7 @@ package:
 
 ```toml
 [patch.crates-io]
+raw-window-handle = { git = "https://github.com/pomaros/raw-window-handle", rev = "39372f3" }
 gpui-pre-platform = { git = "https://github.com/pomaros/gpui-aros", rev = "..." }
 ```
 
