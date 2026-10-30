@@ -18,6 +18,7 @@ zed-version = "0.1.0"
 zed-rev = "279fe070bb389b79652e52065b2f001edcc0b11b"
 
 [features]
+aros-native-gpu = ["gpui_aros/native-gpu"]
 bench-support = ["gpui/bench-support", "gpui_macos/bench-support", "gpui_wgpu/bench-support"]
 default = []
 font-kit = ["gpui_macos/font-kit"]
