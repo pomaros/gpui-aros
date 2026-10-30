@@ -3,14 +3,17 @@
 
 //! Window rendering and native surface lifetime. Portable CPU conformance
 //! remains in renderer.rs; GPU scenes use GPUI's existing WGPU renderer.
-use std::{ffi::c_void, sync::Arc};
-use gpui::{DevicePixels, GpuSpecs, PlatformAtlas, Scene, Size};
 use crate::{glue, renderer::CpuRenderer};
+use gpui::{DevicePixels, GpuSpecs, PlatformAtlas, Scene, Size};
+use std::{ffi::c_void, sync::Arc};
 
 pub(crate) enum WindowRenderer {
     Cpu(CpuRenderer),
     #[cfg(feature = "native-gpu")]
-    Gpu { renderer: gpui_wgpu::WgpuRenderer, first_frame_submitted: bool },
+    Gpu {
+        renderer: gpui_wgpu::WgpuRenderer,
+        first_frame_submitted: bool,
+    },
 }
 
 impl WindowRenderer {
@@ -23,18 +26,33 @@ impl WindowRenderer {
                 .ok_or_else(|| anyhow::anyhow!("Intuition window is unavailable"))?;
             let window = NativeWindowHandle(native);
             let renderer = gpui_wgpu::WgpuRenderer::new(
-                Default::default(), &window,
+                Default::default(),
+                &window,
                 gpui_wgpu::WgpuSurfaceConfig {
-                    size, transparent: false, preferred_present_mode: None,
-                }, None,
+                    size,
+                    transparent: false,
+                    preferred_present_mode: None,
+                },
+                None,
             )?;
-            let specs = renderer.gpu_specs()
+            let specs = renderer
+                .gpu_specs()
                 .ok_or_else(|| anyhow::anyhow!("GPU adapter identity is unavailable"))?;
             if specs.is_software_emulated {
-                anyhow::bail!("native-gpu selected a software adapter: {}", specs.device_name);
+                anyhow::bail!(
+                    "native-gpu selected a software adapter: {}",
+                    specs.device_name
+                );
             }
-            log::info!("AROS GPU renderer: {} ({})", specs.device_name, specs.driver_name);
-            return Ok(Self::Gpu { renderer, first_frame_submitted: false });
+            log::info!(
+                "AROS GPU renderer: {} ({})",
+                specs.device_name,
+                specs.driver_name
+            );
+            return Ok(Self::Gpu {
+                renderer,
+                first_frame_submitted: false,
+            });
         }
         #[cfg(not(feature = "native-gpu"))]
         {
@@ -71,8 +89,10 @@ impl WindowRenderer {
     pub(crate) fn gpu_specs(&self) -> Option<GpuSpecs> {
         match self {
             Self::Cpu(_) => Some(GpuSpecs {
-                is_software_emulated: true, device_name: "AROS CPU".into(),
-                driver_name: "tiny-skia".into(), driver_info: String::new(),
+                is_software_emulated: true,
+                device_name: "AROS CPU".into(),
+                driver_name: "tiny-skia".into(),
+                driver_info: String::new(),
             }),
             #[cfg(feature = "native-gpu")]
             Self::Gpu { renderer: gpu, .. } => gpu.gpu_specs(),
@@ -91,13 +111,23 @@ impl WindowRenderer {
                 let stride = cpu.width() as i32 * 4;
                 let started = std::time::Instant::now();
                 unsafe {
-                    glue::gpa_blit(handle, cpu.framebuffer().as_ptr().cast(), stride,
-                        damage.x0, damage.y0, damage.x1-damage.x0, damage.y1-damage.y0);
+                    glue::gpa_blit(
+                        handle,
+                        cpu.framebuffer().as_ptr().cast(),
+                        stride,
+                        damage.x0,
+                        damage.y0,
+                        damage.x1 - damage.x0,
+                        damage.y1 - damage.y0,
+                    );
                 }
                 crate::stats::painted(raster, started.elapsed(), damage);
             }
             #[cfg(feature = "native-gpu")]
-            Self::Gpu { renderer: gpu, first_frame_submitted } => {
+            Self::Gpu {
+                renderer: gpu,
+                first_frame_submitted,
+            } => {
                 if gpu.draw(scene) {
                     if !*first_frame_submitted {
                         log::info!("AROS GPU first scene submitted");
@@ -125,15 +155,25 @@ unsafe impl Sync for NativeWindowHandle {}
 
 #[cfg(feature = "native-gpu")]
 impl raw_window_handle::HasWindowHandle for NativeWindowHandle {
-    fn window_handle(&self) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
-        Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(
-            raw_window_handle::ArosWindowHandle::new(self.0).into()) })
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        Ok(unsafe {
+            raw_window_handle::WindowHandle::borrow_raw(
+                raw_window_handle::ArosWindowHandle::new(self.0).into(),
+            )
+        })
     }
 }
 #[cfg(feature = "native-gpu")]
 impl raw_window_handle::HasDisplayHandle for NativeWindowHandle {
-    fn display_handle(&self) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
-        Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(
-            raw_window_handle::ArosDisplayHandle::new().into()) })
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        Ok(unsafe {
+            raw_window_handle::DisplayHandle::borrow_raw(
+                raw_window_handle::ArosDisplayHandle::new().into(),
+            )
+        })
     }
 }
