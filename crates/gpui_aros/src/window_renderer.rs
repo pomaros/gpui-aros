@@ -10,7 +10,7 @@ use crate::{glue, renderer::CpuRenderer};
 pub(crate) enum WindowRenderer {
     Cpu(CpuRenderer),
     #[cfg(feature = "native-gpu")]
-    Gpu(gpui_wgpu::WgpuRenderer),
+    Gpu { renderer: gpui_wgpu::WgpuRenderer, first_frame_submitted: bool },
 }
 
 impl WindowRenderer {
@@ -34,7 +34,7 @@ impl WindowRenderer {
                 anyhow::bail!("native-gpu selected a software adapter: {}", specs.device_name);
             }
             log::info!("AROS GPU renderer: {} ({})", specs.device_name, specs.driver_name);
-            return Ok(Self::Gpu(renderer));
+            return Ok(Self::Gpu { renderer, first_frame_submitted: false });
         }
         #[cfg(not(feature = "native-gpu"))]
         {
@@ -47,7 +47,7 @@ impl WindowRenderer {
         match self {
             Self::Cpu(cpu) => cpu.sprite_atlas(),
             #[cfg(feature = "native-gpu")]
-            Self::Gpu(gpu) => gpu.sprite_atlas().clone(),
+            Self::Gpu { renderer: gpu, .. } => gpu.sprite_atlas().clone(),
         }
     }
 
@@ -56,7 +56,7 @@ impl WindowRenderer {
             Self::Cpu(cpu) => cpu.invalidate(),
             // GPU frames render the complete scene, including refresh events.
             #[cfg(feature = "native-gpu")]
-            Self::Gpu(_) => (),
+            Self::Gpu { .. } => (),
         }
     }
 
@@ -64,7 +64,7 @@ impl WindowRenderer {
         match self {
             Self::Cpu(cpu) => cpu.update_drawable_size(size),
             #[cfg(feature = "native-gpu")]
-            Self::Gpu(gpu) => gpu.update_drawable_size(size),
+            Self::Gpu { renderer: gpu, .. } => gpu.update_drawable_size(size),
         }
     }
 
@@ -75,7 +75,7 @@ impl WindowRenderer {
                 driver_name: "tiny-skia".into(), driver_info: String::new(),
             }),
             #[cfg(feature = "native-gpu")]
-            Self::Gpu(gpu) => gpu.gpu_specs(),
+            Self::Gpu { renderer: gpu, .. } => gpu.gpu_specs(),
         }
     }
 
@@ -97,8 +97,13 @@ impl WindowRenderer {
                 crate::stats::painted(raster, started.elapsed(), damage);
             }
             #[cfg(feature = "native-gpu")]
-            Self::Gpu(gpu) => {
-                if !gpu.draw(scene) {
+            Self::Gpu { renderer: gpu, first_frame_submitted } => {
+                if gpu.draw(scene) {
+                    if !*first_frame_submitted {
+                        log::info!("AROS GPU first scene submitted");
+                        *first_frame_submitted = true;
+                    }
+                } else {
                     log::error!("AROS GPU scene was not presented");
                 }
             }
