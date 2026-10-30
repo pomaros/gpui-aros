@@ -46,3 +46,7 @@ cc = "1"
 [lints.rust.unexpected_cfgs]
 level = "warn"
 check-cfg = ['cfg(target_os, values("aros"))']
+
+[[example]]
+name = "native_gpu"
+required-features = ["native-gpu"]
