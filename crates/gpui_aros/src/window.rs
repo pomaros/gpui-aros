@@ -16,7 +16,8 @@ use gpui::{
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams, WindowVisibility, px,
 };
 use raw_window_handle::{
-    DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, WindowHandle,
+    ArosDisplayHandle, ArosWindowHandle, DisplayHandle, HandleError, HasDisplayHandle,
+    HasWindowHandle, WindowHandle,
 };
 
 use crate::glue::{self, GpaEvent, GpaMenuSpec};
@@ -655,13 +656,22 @@ fn map_button(code: c_int) -> MouseButton {
 
 impl HasWindowHandle for ArosWindow {
     fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
-        Err(HandleError::Unavailable)
+        let state = self.inner.state.borrow();
+        if state.closed {
+            return Err(HandleError::Unavailable);
+        }
+        // SAFETY: the wrapper owns this Intuition window until ArosWindowInner
+        // drops. The returned borrow cannot outlive this ArosWindow reference.
+        let native = unsafe { glue::gpa_native_window(state.handle) };
+        let pointer = std::ptr::NonNull::new(native).ok_or(HandleError::Unavailable)?;
+        Ok(unsafe { WindowHandle::borrow_raw(ArosWindowHandle::new(pointer).into()) })
     }
 }
 
 impl HasDisplayHandle for ArosWindow {
     fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
-        Err(HandleError::Unavailable)
+        // SAFETY: the default Intuition display handle borrows no resource.
+        Ok(unsafe { DisplayHandle::borrow_raw(ArosDisplayHandle::new().into()) })
     }
 }
 
