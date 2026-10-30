@@ -122,6 +122,10 @@ are reported rather than silently selecting the CPU renderer. With the feature
 disabled, the existing tiny-skia renderer serves software rendering and its
 portable conformance suite.
 
+The feature links the native `libEGL.a` entry stubs from the selected C SDK.
+`AROS_EGL_LIB_DIR` can select a separately versioned graphics stub directory
+without modifying the managed Rust SDK.
+
 The window owner destroys the renderer/surface before calling CloseWindow.
 The hardware path requires native scene, resize and close qualification before
 being selected by default in application builds.
